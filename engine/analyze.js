@@ -1080,6 +1080,39 @@ function detectRiffs(A, beats, bars, sections, keyPerBar, duration, meter) {
   return riffs;
 }
 
+// ───────────────────────── 11. 歌のメロディ（16 分ごとの音の高さ。歌の区間だけ・推定）
+// 目的：歌の休み（息つぎ）の場所・次に歌い出す音・長くのばしている音を知る（合いの手と、ぶつからない伴奏のため）
+function estimateVocalLine(A, beats, beatVocal, duration) {
+  const nb = beats.length;
+  const line = new Array(nb * 4).fill(-1);
+  const sv = [];
+  for (let t = 0; t < A.F; t += 5) sv.push(A.melTopS[t * A.TOPK]);
+  const thr = Math.max(0.1, percentile(sv, 0.35) * 0.7);
+  for (let i = 0; i < nb; i++) {
+    if (!beatVocal[i]) continue;
+    const t0 = beats[i], t1 = i + 1 < nb ? beats[i + 1] : duration;
+    for (let k = 0; k < 4; k++) {
+      const a = t0 + ((t1 - t0) * (k + 0.25)) / 4 - ONSET_LAG, b = t0 + ((t1 - t0) * (k + 0.9)) / 4 - ONSET_LAG;
+      const ps = [];
+      for (let f = Math.max(0, Math.floor(a * A.fps)); f < Math.min(A.F, Math.ceil(b * A.fps)); f++) {
+        // 上位 3 つの候補のうち、歌の音域（E3〜C6）で一番目立つもの
+        for (let q = 0; q < A.TOPK; q++) {
+          const m = A.melTopP[f * A.TOPK + q] - A.tuning / 100;
+          if (m >= 52 && m <= 84 && A.melTopS[f * A.TOPK + q] >= thr) { ps.push(m); break; }
+        }
+      }
+      const fr = Math.max(1, Math.ceil(b * A.fps) - Math.floor(a * A.fps));
+      if (ps.length >= fr * 0.5) line[i * 4 + k] = Math.round(median(ps));
+    }
+  }
+  // 1 つだけ飛び出た音・1 つだけの休みをならす
+  for (let s = 1; s + 1 < line.length; s++) {
+    if (line[s] >= 0 && line[s - 1] < 0 && line[s + 1] < 0) line[s] = -1;
+    else if (line[s] < 0 && line[s - 1] >= 0 && line[s - 1] === line[s + 1]) line[s] = line[s - 1];
+  }
+  return line;
+}
+
 // ───────────────────────── 全体
 export function analyze(input, opts = {}) {
   const progress = opts.progress || (() => {});
@@ -1162,6 +1195,7 @@ export function analyze(input, opts = {}) {
     for (let k = 0; k < bar.n; k++) if (beatVocal[bar.b0 + k]) c++;
     return c / bar.n >= 0.4;
   });
+  const vocalLine = estimateVocalLine(A, beats, beatVocal, duration);
   // 小節の特徴（音の色＋和音）
   const barEnergy = bars.map((bar) => {
     const f0 = Math.floor(bar.t0 * A.fps), f1 = Math.min(A.F, Math.ceil(bar.t1 * A.fps));
@@ -1208,6 +1242,7 @@ export function analyze(input, opts = {}) {
     bassChroma: chroma.bass.map((c) => c.map((x) => Math.round(x * 1000) / 1000)),
     beatEnergy: chroma.energy,
     vocalProb: Array.from(vprob),
+    vocalLine,
     vocalSource: opts.listen ? 'ai' : 'fallback',
     barVocal,
     barEnergy,

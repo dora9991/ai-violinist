@@ -21,4 +21,4 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 （このライセンスはプログラムのものです。音・データ・AI モデルは、それぞれのライセンスに従います：
- samples-free/LICENSE-VSCO.txt・engine/phrases-LICENSE.txt・models/LICENSE・vendor/ort/LICENSE）
+ samples-free/LICENSE-VSCO.txt・engine/phrases-LICENSE.txt・engine/linemodel-LICENSE.txt・models/LICENSE・vendor/ort/LICENSE）

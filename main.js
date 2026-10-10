@@ -1,5 +1,5 @@
 // AIバイオリニスト：画面の動き
-import { compose, setPhrases, phraseInfo, ROLE_LABEL, TYPE_LABEL, STYLES, LOW, HIGH } from './engine/compose.js';
+import { compose, setPhrases, phraseInfo, setLineModel, lineModelInfo, ROLE_LABEL, TYPE_LABEL, STYLES, LOW, HIGH } from './engine/compose.js';
 import { chordName, keyNameJa, keyNameTrad, halfShift, pcName } from './engine/analyze.js';
 import { loadViolin, makeViolinBus, scheduleViolin, renderMix, loudnessOf } from './engine/sampler.js';
 import { audioBufferToWav, notesToMidi, download } from './engine/files.js';
@@ -91,7 +91,11 @@ async function pollStatus() {
 }
 pollStatus();
 // ギタリストのソロ（GuitarSet）から学んだフレーズ
-const licksP = fetch('engine/phrases.json').then((r) => (r.ok ? r.json() : null)).then((j) => { if (j) setPhrases(j); }).catch(() => {});
+const licksP = Promise.all([
+  fetch('engine/phrases.json').then((r) => (r.ok ? r.json() : null)).then((j) => { if (j) setPhrases(j); }).catch(() => {}),
+  // プロのアレンジ（POP909）とギターソロから学んだ「線のつながり方」
+  fetch('engine/linemodel.json').then((r) => (r.ok ? r.json() : null)).then((j) => { if (j) setLineModel(j); }).catch(() => {}),
+]);
 
 // ───────────────────────── 音の準備
 function ensureAudio() {
@@ -581,8 +585,12 @@ function renderFound() {
   an.keyPerBar.forEach((k, i) => { if (!i || k.tonic !== an.keyPerBar[i - 1].tonic || k.mode !== an.keyPerBar[i - 1].mode) keys.push(`${keyNameTrad(k)}（${fmt(an.bars[i].t0)}〜）`); });
   lines.push(`<p><b>曲全体の調</b>：${keyNameJa(an.key)}（${keyNameTrad(an.key)}）${an.key.manual ? '　※手で指定' : ''}。コードとコードの間の音は、この調の音階から選び、原曲の音と半音でぶつかる音は使いません</p>`);
   if (keys.length > 1) lines.push(`<p><b>転調</b>：${keys.join(' → ')}（長く続く、はっきりした転調だけを採用）</p>`);
-  const li = phraseInfo();
-  if (li) lines.push(`<p><b>ソロのフレーズ</b>：ギタリストの実際のソロ演奏（GuitarSet）から学んだ ${li.count} 個のフレーズを、この曲のコードに合わせて置きかえて弾きます</p>`);
+  const lm = lineModelInfo();
+  if (lm) lines.push(`<p><b>旋律のつながり</b>：ポップスのプロのアレンジ ${lm.songs.inst} 曲の副旋律と、ギターソロ ${lm.songs.solo} 曲（合わせて ${Math.round(lm.notes / 1000)} 千音）から学んだ「次のコードへの入り方・跳んだあとの戻り方・フレーズの終わり方・歌の息つぎへの入り方・強弱」で、ソロ・対旋律・合いの手を 1 音ずつ選びます${S.an.vocalLine ? '（歌のメロディも推定して、歌い出しの音へつなげます）' : ''}</p>`);
+  else {
+    const li = phraseInfo();
+    if (li) lines.push(`<p><b>ソロのフレーズ</b>：ギタリストの実際のソロ演奏（GuitarSet）から学んだ ${li.count} 個のフレーズを、この曲のコードに合わせて置きかえて弾きます</p>`);
+  }
   lines.push(`<p><b>テンポ</b>：${an.bpm.toFixed(2)} BPM ${an.steadyTempo ? '（一定。打ち込みの曲のようです）' : '（揺れあり。拍を1つずつ追いかけます）'}・ピッチ ${an.tuning >= 0 ? '+' : ''}${an.tuning.toFixed(1)} セント（バイオリンも合わせます）</p>`);
   $('found-body').innerHTML = lines.join('');
 }

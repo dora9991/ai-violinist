@@ -2,7 +2,9 @@
 // 歌の裏：そっと長い音（そっと伴奏）／サビ：動きのある対旋律／間奏・イントロ：ソロ／目立つリフ：まねる
 import { scaleOf, MAJOR_SCALE, MINOR_SCALE } from './analyze.js';
 import { genSoloV3 } from './solo.js';
+import { genLine, hasLineModel, connectLp, dynamicsFor } from './line.js';
 export { setPhrases, phraseInfo } from './solo.js';
+export { setLineModel, lineModelInfo, lineScore } from './line.js';
 
 export const LOW = 55; // G3
 export const HIGH = 91; // G6
@@ -85,7 +87,24 @@ function makeCtx(an, settings) {
     return 2;
   };
   const vocalAt = (x) => an.vocalProb[bi(x)] || 0;
-  return { an, settings, rand, beatTime, beatLen, chordPcs: safeChordPcs, rawChordPcs: chordPcs, chordRoot, keyAt, scalePcs, tension, heard, clashes, vocalAt, nb, style: STYLES[settings.style] || STYLES.emotional };
+  // 歌のメロディ（推定・16 分ごと）：息つぎの場所・次に歌い出す音
+  const VL = an.vocalLine || null;
+  const vocalPitch = (step) => { if (!VL || step < 0 || step >= VL.length) return null; const v = VL[step]; return v >= 0 ? v : null; };
+  let nextOn = null;
+  if (VL) {
+    nextOn = new Int32Array(VL.length);
+    let nx = 1e9;
+    for (let s = VL.length - 1; s >= 0; s--) { if (VL[s] >= 0 && (s === 0 || VL[s - 1] !== VL[s])) nx = s; nextOn[s] = Math.min(1e6, nx - s); }
+  }
+  const vocalState = (step) => {
+    if (!VL || step < 0 || step >= VL.length) return null;
+    const v = VL[step];
+    const state = v < 0 ? 'rest' : step > 0 && VL[step - 1] === v ? 'hold' : 'on';
+    const u = nextOn[step];
+    return { state, ub: u <= 1 ? 0 : u <= 3 ? 1 : u <= 7 ? 2 : u <= 15 ? 3 : 4 };
+  };
+  const nextVocalNote = (step) => { if (!VL || step < 0 || step >= VL.length) return null; const u = nextOn[step]; return u < 32 ? VL[step + u] : null; };
+  return { an, settings, rand, beatTime, beatLen, chordPcs: safeChordPcs, rawChordPcs: chordPcs, chordRoot, keyAt, scalePcs, tension, heard, clashes, vocalAt, vocalPitch, vocalState, nextVocalNote, hasVocalLine: !!VL, nb, style: STYLES[settings.style] || STYLES.emotional };
 }
 
 // 区間の中の小節（拍の位置）
@@ -217,7 +236,13 @@ function genPad(ctx, item, out, prevNote) {
     back.push(new Array(cand[i].length).fill(-1));
     for (let j = 0; j < cand[i].length; j++) {
       const m = cand[i][j];
-      const local = PC_ROLE_COST(m, ctx, spans[i].x) + 0.07 * Math.abs(m - centerAt(i)) + rand() * 0.05;
+      let local = PC_ROLE_COST(m, ctx, spans[i].x) + 0.07 * Math.abs(m - centerAt(i)) + rand() * 0.05;
+      // 歌とこすれない（歌の音と 2度でぶつかる長い音は避ける）
+      if (ctx.hasVocalLine) {
+        let rub = 0;
+        for (let k = 0; k < spans[i].len * 4; k++) { const v = ctx.vocalPitch(spans[i].x * 4 + k); if (v != null) { const d = Math.abs(m - v) % 12; if (d === 1 || d === 2 || d === 11 || d === 10) rub++; } }
+        local += 0.15 * rub;
+      }
       if (i === 0) {
         const from = prevNote ? prevNote.midi : Math.round(centerAt(0));
         cost[i][j] = local + 0.25 * Math.abs(m - from);
@@ -228,6 +253,12 @@ function genPad(ctx, item, out, prevNote) {
         const iv = Math.abs(m - p);
         let tc = iv === 0 ? 0.35 : iv <= 2 ? 0.05 : iv <= 4 ? 0.3 : iv <= 7 ? 1.2 : 3;
         if (rising && m < p) tc += 0.5;
+        // 学んだ「コードが変わる所のつながり」（例：次のコードの 4度にいた音は 3度へ）
+        if (hasLineModel()) {
+          const r = ctx.chordRoot(spans[i].x);
+          const c = connectLp(pcOf(p - r), pcOf(m - r));
+          if (c != null) tc -= 0.35 * (c + 2.3);
+        }
         const v = cost[i - 1][q] + tc + local;
         if (v < cost[i][j]) { cost[i][j] = v; back[i][j] = q; }
       }
@@ -506,6 +537,161 @@ function genCounter(ctx, item, out, prevNote) {
   return last;
 }
 
+
+// ───────────────────────── 学んだ統計で作る線（ソロ・対旋律・合いの手）
+// 線（genLine の結果）を、鳴らす音符にする
+function lineToNotes(ctx, item, ln, role, velOf, opt = {}) {
+  const { rand, style } = ctx;
+  const out = [];
+  let peak = null;
+  for (const n of ln) if (n.len >= 0.75 && (!peak || n.midi > peak.midi)) peak = n;
+  const dyn = dynamicsFor(ln);
+  ln.forEach((n, i) => {
+    const t = ctx.beatTime(n.x), te = ctx.beatTime(n.x + n.len);
+    const d = te - t;
+    const pv = ln[i - 1];
+    const touching = pv && Math.abs(pv.x + pv.len - n.x) < 1e-6;
+    const note = {
+      t, d, midi: n.midi, vel: clamp(velOf(n, i) + dyn[i], 0.15, 1),
+      art: !touching && d > 0.9 ? 'sneak' : !touching && d < 0.3 && n.onBeat && opt.accent ? 'mrc' : 'sus',
+      legato: !!touching, shape: d >= 0.8 ? 'swell' : 'flat', role, sec: item.si,
+    };
+    if (d >= 0.6 && pv && n.midi - pv.midi >= 4 && rand() < style.slide) note.slide = -2;
+    if (n.len >= 1 && (n === peak || n.phraseEnd)) note.vib = 1;
+    out.push(note);
+  });
+  return out;
+}
+const barsOf = (ctx, item) => sectionBars(ctx.an, item.sec).filter((b) => !b.pickup && b.n === 4);
+// 次の区間のはじめの音（つながりの目標）
+function nextTargetPitch(ctx, item, center) {
+  const an = ctx.an;
+  const nextSec = an.sections[item.si + 1];
+  if (!nextSec) return null;
+  const x = an.bars[nextSec.bar0].b0;
+  // 次が歌なら、歌い出しの音（推定）へ。なければ次のコードの音
+  const v = ctx.nextVocalNote(x * 4);
+  if (v != null) { let m = v; while (m < center - 7) m += 12; while (m > center + 7) m -= 12; return m; }
+  const pcs = ctx.chordPcs(x);
+  return nearestIn(Math.round(center), pcs, 55, 91);
+}
+
+function genSoloLine(ctx, item, out, prevNote, nextIsVocal) {
+  const bars = barsOf(ctx, item);
+  if (bars.length < 1) return prevNote;
+  const sec = item.sec;
+  const isIntro = sec.type === 'intro', isOutro = sec.type === 'outro';
+  const motion = ctx.settings.soloMotion ?? 1;
+  const inten = item.intensity;
+  // 1 小節の音の数のめやす（はじめ → 終わりでだんだん増える）
+  const dens = [[[2, 5], [3, 7]], [[3, 7], [6, 11]], [[5, 10], [8, 14]]][motion];
+  const N = bars.length;
+  const startC = prevNote ? clamp(prevNote.midi, 69, 81) : 74;
+  const hi = isIntro || isOutro ? 86 : 90;
+  const center = (p) => clamp(startC + (isOutro ? -2 : 8 * inten) * Math.sin((Math.PI / 2) * Math.min(1, p * 1.2)), 66, hi - 4);
+  const ln = genLine(ctx, {
+    kind: 'solo', bars,
+    densityAt: (bi) => { const p = bi / Math.max(1, N - 1); const a = dens[0], b = dens[1]; return [Math.round(a[0] + (b[0] - a[0]) * p), Math.round(a[1] + (b[1] - a[1]) * p)]; },
+    lo: 62, hi, center, prev: prevNote ? prevNote.midi : null,
+    target: nextTargetPitch(ctx, item, center(1)),
+    endLong: !nextIsVocal, endRest: nextIsVocal,
+    phraseBars: motion === 2 ? 4 : 2, // 2〜4 小節ごとに息つぎ
+    beam: 28,
+  });
+  if (!ln.length) return genSoloV3(ctx, item, out, prevNote, nextIsVocal, sectionBars(ctx.an, sec).filter((b) => !b.pickup));
+  // 最後の音：次が歌でなければ長くのばして決める
+  const last = ln[ln.length - 1];
+  const end = bars[N - 1].b0 + 4;
+  if (!nextIsVocal && end - last.x > last.len) last.len = Math.min(end - last.x, Math.max(last.len, 2));
+  const notes = lineToNotes(ctx, item, ln, 'solo', (n, i) => 0.45 + 0.4 * inten * (0.75 + 0.25 * (i / ln.length)) + (n.onBeat ? 0.05 : 0), { accent: inten > 0.6 });
+  const lastOut = notes[notes.length - 1];
+  if (lastOut) { lastOut.vib = 1; lastOut.shape = nextIsVocal ? 'fade' : 'swell'; }
+  out.push(...notes);
+  return lastOut || prevNote;
+}
+
+function genCounterLine(ctx, item, out, prevNote) {
+  const bars = barsOf(ctx, item);
+  if (!bars.length) return prevNote;
+  const motion = ctx.settings.motion ?? 1;
+  const inten = item.intensity;
+  const dens = [[1, 3], [2, 5], [3, 8]][motion];
+  const N = bars.length;
+  const center = (p) => 75 + 4 * Math.sin(Math.PI * Math.min(1, p * 1.1));
+  // 歌っている最中は長くのばし、動くのは歌の息つぎで（弦のアレンジの基本）：歌の途中の短い音は、前の音にまとめる
+  const shapeRhythm = (notes) => {
+    if (!ctx.hasVocalLine) return notes;
+    const out2 = [];
+    for (const nt of notes) {
+      const st = ctx.vocalState(nt.step);
+      const singing = st && st.state !== 'rest';
+      const prevNt = out2[out2.length - 1];
+      if (singing && nt.len < 4 && prevNt && nt.step - (prevNt.step + prevNt.len) <= 1) { prevNt.len = nt.step + nt.len - prevNt.step; continue; }
+      out2.push({ ...nt });
+    }
+    return out2;
+  };
+  const ln = genLine(ctx, {
+    kind: 'counter', bars, densityAt: () => dens, shapeRhythm,
+    lo: 67, hi: inten > 0.8 ? 89 : 86, center, prev: prevNote ? prevNote.midi : null,
+    target: nextTargetPitch(ctx, item, center(1)),
+    vocalPitch: ctx.vocalPitch, vocalState: ctx.hasVocalLine ? ctx.vocalState : null, fillWeight: 0.9, vocalWeight: 0.8,
+    endLong: true, phraseBars: 4, beam: 24,
+  });
+  if (!ln.length) return genCounter(ctx, item, out, prevNote);
+  const notes = lineToNotes(ctx, item, ln, 'counter', (n, i) => 0.35 + 0.42 * inten + 0.08 * Math.sin((Math.PI * i) / Math.max(1, ln.length - 1)) + (n.onBeat ? 0.03 : -0.02));
+  out.push(...notes);
+  return notes[notes.length - 1] || prevNote;
+}
+
+// 合いの手：歌の息つぎ（1.5 拍以上の休み）に、次に歌い出す音へつながる短いフレーズ
+function addLineFills(ctx, item, out) {
+  const { an, rand } = ctx;
+  const presence = ctx.settings.presence ?? 0.6, motion = ctx.settings.motion ?? 1;
+  if (presence < 0.4 || !ctx.hasVocalLine) return false;
+  const bars = barsOf(ctx, item);
+  if (!bars.length) return false;
+  const s0 = bars[0].b0 * 4, s1 = (bars[bars.length - 1].b0 + 4) * 4;
+  const gaps = [];
+  let a = null;
+  for (let st = s0; st <= s1; st++) {
+    const v = st < s1 ? ctx.vocalPitch(st) : 0;
+    if (v == null) { if (a == null) a = st; }
+    else { if (a != null && st - a >= 6 && st < s1) gaps.push([a, st]); a = null; }
+  }
+  const p = Math.min(0.85, 0.25 + 0.3 * presence + 0.15 * motion);
+  let made = 0;
+  for (const [ga, gb] of gaps) {
+    if (rand() > p) continue;
+    const fa = Math.max(ga + 1, gb - (motion >= 2 ? 12 : 8)), fb = gb - 1; // 歌い出しの 16 分ひとつ前で終わる
+    if (fb - fa < 3) continue;
+    const firstBar = Math.floor(fa / 16), lastBar = Math.floor((fb - 1) / 16);
+    const bs = an.bars.filter((b) => !b.pickup && b.n === 4 && Math.floor((b.b0 * 4) / 16) >= firstBar - 0 && b.b0 * 4 <= fb && b.b0 * 4 + 16 > fa);
+    if (!bs.length) continue;
+    const before = out.filter((n) => n.t < ctx.beatTime(fa / 4)).pop();
+    const v = ctx.nextVocalNote(gb);
+    const center = before ? before.midi : 76;
+    let target = null;
+    if (v != null) { target = v; while (target < center - 6) target += 12; while (target > center + 6) target -= 12; }
+    const ln = genLine(ctx, {
+      kind: 'fill', bars: bs, densityAt: () => [3, 12],
+      keep: (n) => n.step >= fa && n.step < fb,
+      lo: 64, hi: 86, center: () => center, prev: before ? before.midi : null, target,
+      vocalPitch: ctx.vocalPitch, vocalState: ctx.vocalState, fillWeight: 1.5, beam: 20,
+    });
+    if (ln.length < 2) continue;
+    // 歌い出しまでに終わる
+    for (const n of ln) if ((n.x + n.len) * 4 > fb) n.len = Math.max(0.25, fb / 4 - n.x);
+    // 下でのびている伴奏の音は、合いの手の前で切る
+    const tFill = ctx.beatTime(ln[0].x);
+    for (const nn of out) if (nn.t < tFill && nn.t + nn.d > tFill) nn.d = Math.max(0.12, tFill - nn.t);
+    const vel0 = before ? before.vel : 0.4;
+    out.push(...lineToNotes(ctx, item, ln, 'fill', () => clamp(vel0 + 0.08, 0.3, 0.7)));
+    made++;
+  }
+  return made > 0 || gaps.length > 0;
+}
+
 // ───────────────────────── リフをまねる
 function genRiff(ctx, item, out, prevNote) {
   const { an, rand } = ctx;
@@ -604,13 +790,16 @@ export function compose(an, settings = {}) {
     switch (item.role) {
       case 'pad':
         prev = genPad(ctx, item, notes, prev);
-        if (item.sec.vocal) addFills(ctx, item, notes);
+        // 合いの手：歌のメロディが取れていれば「次の歌い出しへつながる」学んだ線、取れなければ前の作り方
+        if (item.sec.vocal && !(hasLineModel() && an.meter === 4 && addLineFills(ctx, item, notes))) addFills(ctx, item, notes);
         break;
       case 'counter':
-        prev = genCounter(ctx, item, notes, prev);
+        prev = hasLineModel() && an.meter === 4 ? genCounterLine(ctx, item, notes, prev) : genCounter(ctx, item, notes, prev);
         break;
       case 'solo':
-        prev = genSoloV3(ctx, item, notes, prev, nextVocal, sectionBars(an, item.sec).filter((b) => !b.pickup));
+        prev = hasLineModel() && an.meter === 4
+          ? genSoloLine(ctx, item, notes, prev, nextVocal)
+          : genSoloV3(ctx, item, notes, prev, nextVocal, sectionBars(an, item.sec).filter((b) => !b.pickup));
         break;
       case 'arp':
         prev = genArp(ctx, item, notes, prev);
