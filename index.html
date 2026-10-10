@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="vai-mode" content="static">
+<meta name="description" content="曲を入れると、AI がバイオリンのパートを書き足します。歌の裏はそっと、間奏ではソロ。MIDI と楽譜にも。曲はパソコンの中だけで処理します。">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIバイオリニスト</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M40 6c4 0 6 3 5 6l-3 9c4 3 6 8 4 13-1 3-4 5-4 8 0 6 6 7 6 13 0 5-6 8-14 8s-14-3-14-8c0-6 6-7 6-13 0-3-3-5-4-8-2-5 0-10 4-13l-3-9c-1-3 1-6 5-6z' fill='%23d79a4e'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 64 64" aria-hidden="true"><path d="M40 6c4 0 6 3 5 6l-3 9c4 3 6 8 4 13-1 3-4 5-4 8 0 6 6 7 6 13 0 5-6 8-14 8s-14-3-14-8c0-6 6-7 6-13 0-3-3-5-4-8-2-5 0-10 4-13l-3-9c-1-3 1-6 5-6z" fill="currentColor"/><path d="M32 18v40M29 40h6M29 44h6" stroke="#1a1512" stroke-width="2" stroke-linecap="round"/></svg>
+    <div>
+      <h1>AIバイオリニスト</h1>
+      <p class="sub">曲を入れると、AI がバイオリンを書き足します</p>
+    </div>
+  </div>
+  <div class="status" id="status">
+    <span class="st"><span class="dot" id="st-samples"></span><span id="st-samples-t">バイオリンの音を確認中…</span></span>
+    <span class="st"><span class="dot" id="st-listen"></span><span id="st-listen-t">歌の判定AIを確認中…</span></span>
+  </div>
+</header>
+
+<main>
+  <!-- 1. 曲を入れる -->
+  <section id="drop" class="drop">
+    <div class="drop-inner">
+      <div class="drop-icon" aria-hidden="true">♪</div>
+      <h2>曲をここにドロップ</h2>
+      <p>mp3 / m4a / wav など。歌の入った曲がおすすめです。<br><small class="privacy">曲はこのパソコンの中だけで処理します（どこにも送りません）</small></p>
+      <label class="btn primary">
+        <input type="file" id="file" accept="audio/*,.m4a,.mp3,.wav,.aif,.aiff,.flac" hidden>
+        <span>ファイルを選ぶ</span>
+      </label>
+      <ul class="how">
+        <li><b>歌っているところ</b>は、裏でそっと長い音</li>
+        <li><b>サビ</b>は、歌に寄りそう対旋律</li>
+        <li><b>間奏・イントロ</b>は、かっこいいソロ</li>
+        <li><b>目立つリフ</b>は、バイオリンでまねる</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 2. 解析中 -->
+  <section id="busy" class="busy" hidden>
+    <h2 id="busy-title">曲を聞いています</h2>
+    <ol class="steps" id="steps">
+      <li data-k="load">曲を読み込む</li>
+      <li data-k="listen">歌っている場所を AI が聞き分ける</li>
+      <li data-k="beats">拍・コード・調を聞き取る</li>
+      <li data-k="sections">曲の区切りとリフを探す</li>
+      <li data-k="compose">バイオリンを作曲する</li>
+    </ol>
+    <div class="bar"><div class="bar-fill" id="busy-bar"></div></div>
+    <p class="busy-note" id="busy-note"></p>
+  </section>
+
+  <!-- 3. 編集 -->
+  <section id="studio" hidden>
+    <div class="songbar">
+      <div class="songinfo">
+        <span class="songname" id="songname"></span>
+        <span class="facts" id="facts"></span>
+      </div>
+      <div class="fixes" role="group" aria-label="解析の手直し">
+        <span class="fix-label">拍がずれていたら</span>
+        <button class="btn small" data-fix="half">テンポ ÷2</button>
+        <button class="btn small" data-fix="double">テンポ ×2</button>
+        <button class="btn small" data-fix="shift">半拍ずらす</button>
+        <button class="btn small" data-fix="bar">小節の頭を1拍ずらす</button>
+        <button class="btn small" data-fix="meter">3拍子 ⇄ 4拍子</button>
+        <label class="keyfix">調<select id="key-fix" title="曲の調。AI の判定がちがうときは選び直せます"></select></label>
+        <button class="btn small ghost" id="another">別の曲</button>
+      </div>
+    </div>
+
+    <div class="timeline-wrap">
+      <div class="rowlabels" aria-hidden="true">
+        <div style="height:18px"></div>
+        <div class="rl" style="height:34px">区切り</div>
+        <div class="rl" style="height:22px">コード</div>
+        <div class="rl" style="height:58px">原曲<br><small>青＝歌</small></div>
+        <div class="rl" style="height:150px">バイオリン</div>
+      </div>
+      <div class="timeline" id="timeline">
+        <div class="tl-inner" id="tl-inner">
+          <canvas id="tl-canvas"></canvas>
+          <div class="playhead" id="playhead"></div>
+        </div>
+      </div>
+    </div>
+    <div class="legend" id="legend"></div>
+
+    <div class="transport">
+      <button class="btn play" id="play" aria-label="再生・一時停止"><span class="i-play">▶</span><span class="i-pause">❚❚</span></button>
+      <span class="time" id="time">0:00 / 0:00</span>
+      <div class="seg" role="group" aria-label="聞き方" id="mode">
+        <button data-mode="both" class="on">両方</button>
+        <button data-mode="song">原曲だけ</button>
+        <button data-mode="violin">バイオリンだけ</button>
+      </div>
+      <label class="slider">バイオリン<input type="range" id="vol-violin" min="0" max="2" step="0.01" value="1"></label>
+      <label class="slider">原曲<input type="range" id="vol-song" min="0" max="1.5" step="0.01" value="1"></label>
+      <label class="slider">響き<input type="range" id="reverb" min="0" max="0.8" step="0.01" value="0.28"></label>
+    </div>
+
+    <div class="panel arrange">
+      <div class="ctrl">
+        <span class="ctrl-label">弾き方</span>
+        <div class="seg" id="style">
+          <button data-style="emotional" class="on">エモーショナル</button>
+          <button data-style="classical">クラシカル</button>
+          <button data-style="rock">ロック</button>
+          <button data-style="celtic">ケルト</button>
+        </div>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">存在感</span>
+        <div class="seg" id="presence">
+          <button data-p="0.35">控えめ</button>
+          <button data-p="0.6" class="on">ふつう</button>
+          <button data-p="0.85">たっぷり</button>
+        </div>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">ソロの動き</span>
+        <div class="seg" id="solo-motion">
+          <button data-v="0">ゆったり</button>
+          <button data-v="1" class="on">ふつう</button>
+          <button data-v="2">激しく</button>
+        </div>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">伴奏の動き</span>
+        <div class="seg" id="motion">
+          <button data-v="0">しっとり</button>
+          <button data-v="1" class="on">ほどよく</button>
+          <button data-v="2">リズミカル</button>
+        </div>
+      </div>
+      <div class="ctrl" id="sound-row" hidden>
+        <span class="ctrl-label">バイオリンの音</span>
+        <div class="seg" id="sound">
+          <button data-v="free" class="on">フリー音源（公開版と同じ）</button>
+          <button data-v="logic">Logic の音（この Mac だけ）</button>
+        </div>
+      </div>
+      <button class="btn accent" id="reroll">別のアイデアで作り直す</button>
+      <span class="idea" id="idea"></span>
+    </div>
+
+    <h3 class="h3">区間ごとの弾き方 <small>AI のおまかせを変えられます。歌の判定がちがうときは「歌あり／歌なし」を押して直せます。</small></h3>
+    <div class="sections" id="sections"></div>
+
+    <div class="panel exports">
+      <span class="ctrl-label">保存</span>
+      <button class="btn primary" data-export="mix">ミックスを保存（WAV）</button>
+      <button class="btn" data-export="violin">バイオリンだけ（WAV）</button>
+      <button class="btn" data-export="midi">MIDI（Logic 用・テンポ入り）</button>
+      <button class="btn" data-export="score">楽譜を見る・印刷（PDF）</button>
+      <button class="btn" data-export="musicxml">楽譜ファイル（MusicXML）</button>
+      <span class="export-note" id="export-note"></span>
+    </div>
+
+    <details class="panel found" id="found" open>
+      <summary>AI が聞き取ったこと</summary>
+      <div id="found-body"></div>
+    </details>
+  </section>
+  <footer class="credits">
+    使っている素材：バイオリンの音＝<a href="https://versilian-studios.com/vsco-community/" target="_blank" rel="noopener">VSCO 2 Community Edition</a>（Versilian Studios・CC0）／
+    ソロのフレーズ＝<a href="https://guitarset.weebly.com/" target="_blank" rel="noopener">GuitarSet</a>（Xi, Bittner, Pauwels, Ye, Bello, ISMIR 2018・<a href="https://creativecommons.org/licenses/by/4.0/deed.ja" target="_blank" rel="noopener">CC BY 4.0</a>）から学んだ型／
+    歌の判定＝Google の <a href="https://github.com/tensorflow/models/tree/master/research/audioset/yamnet" target="_blank" rel="noopener">YAMNet</a>（Apache 2.0）＋<a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">ONNX Runtime Web</a>（MIT）
+  </footer>
+</main>
+
+<div class="score-view" id="score-view" hidden>
+  <div class="score-bar">
+    <b>楽譜</b>
+    <span class="score-hint">印刷の画面で「PDF として保存」を選ぶと PDF になります。拍と小節に合わせて、16分音符の細かさにそろえています。</span>
+    <button class="btn primary" id="score-print">印刷・PDF で保存</button>
+    <button class="btn" id="score-xml">MusicXML を保存</button>
+    <button class="btn ghost" id="score-close">閉じる</button>
+  </div>
+  <div class="score-scroll"><div class="score-page" id="score-page"></div></div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script type="module" src="main.js"></script>
+</body>
+</html>

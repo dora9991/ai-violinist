@@ -1,0 +1,7 @@
+phrases.json は、GuitarSet のソロ演奏の注釈（ロック・ファンク・シンガーソングライター 108 曲）から、
+フレーズごとのリズムと「コードに対する音の役割」を取り出して作り直したものです。
+
+GuitarSet: Q. Xi, R. Bittner, J. Pauwels, X. Ye, J. P. Bello,
+"GuitarSet: A Dataset for Guitar Transcription", ISMIR 2018. https://doi.org/10.5281/zenodo.3371780
+License: Creative Commons Attribution 4.0 International (CC BY 4.0) https://creativecommons.org/licenses/by/4.0/
+変更点：音の高さ・タイミングの注釈から、16 分音符にそろえたリズム・コードの根音からの音程・調の主音からの音程を計算し、フレーズに分けた。
