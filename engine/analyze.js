@@ -97,10 +97,11 @@ function stageA(L, R, sr, progress) {
     if (!list.length) list.push(Math.max(1, Math.round((c * N) / sr)), 1);
     bands.push(list);
   }
-  const lowBands = [], bodyBands = [];
+  const lowBands = [], bodyBands = [], highBands = [];
   for (let b = 0; b < NB; b++) {
     if (edges[b + 1] < 160) lowBands.push(b);
     if (edges[b] > 200 && edges[b + 1] < 2500) bodyBands.push(b);
+    if (edges[b] > 5000) highBands.push(b);
   }
   const logmel = new Float32Array(F * NB);
   const rms = new Float32Array(F);
@@ -251,7 +252,7 @@ function stageA(L, R, sr, progress) {
     cy += Math.sin(ang) * tuneHist[b];
   }
   const tuning = (Math.atan2(cy, cx) / (2 * Math.PI)) * 100;
-  return { F, hop, fps: sr / hop, NB, logmel, lowBands, bodyBands, rms, vprox, vfrac, sideFrac, melPitch, melSal, melRel, melTopP, melTopS, TOPK, tuning };
+  return { F, hop, fps: sr / hop, NB, logmel, lowBands, bodyBands, highBands, rms, vprox, vfrac, sideFrac, melPitch, melSal, melRel, melTopP, melTopS, TOPK, tuning };
 }
 
 // ───────────────────────── 2. 長い窓のスペクトル（コード・調・ベース）
@@ -297,10 +298,15 @@ function stageB(L, R, sr, tuning, progress) {
 
 // ───────────────────────── 3. 拍
 function onsetEnvelope(A) {
-  const { F, NB, logmel, lowBands, bodyBands } = A;
-  const raw = new Float32Array(F), low = new Float32Array(F), body = new Float32Array(F);
+  const { F, NB, logmel, lowBands, bodyBands, highBands } = A;
+  const raw = new Float32Array(F), low = new Float32Array(F), body = new Float32Array(F), high = new Float32Array(F);
   for (let t = 1; t < F; t++) {
-    let s = 0, sl = 0, sb = 0;
+    let s = 0, sl = 0, sb = 0, sh = 0;
+    for (const b of highBands) {
+      const d = logmel[t * NB + b] - logmel[(t - 1) * NB + b];
+      if (d > 0) sh += d;
+    }
+    high[t] = sh / Math.max(1, highBands.length);
     for (const b of bodyBands) {
       const d = logmel[t * NB + b] - logmel[(t - 1) * NB + b];
       if (d > 0) sb += d;
@@ -333,7 +339,7 @@ function onsetEnvelope(A) {
     for (let t = 0; t < F; t++) out[t] /= sd;
     return out;
   };
-  return { onset: hp(raw), lowOnset: hp(low), bodyOnset: hp(body) };
+  return { onset: hp(raw), lowOnset: hp(low), bodyOnset: hp(body), highOnset: hp(high) };
 }
 
 function estimateTempo(onset, fps, prefer = 120) {
@@ -1113,6 +1119,95 @@ function estimateVocalLine(A, beats, beatVocal, duration) {
   return line;
 }
 
+// ───────────────────────── 12. ドラム・ベースのリズム（小節ごと・16 分ごとの強さ）
+// k＝キック・ベース（低い音の立ち上がり）、s＝スネアなど（中くらいの音）、h＝ハイハット（高い音）。0〜1
+function computeGroove(bars, beats, env, fps, meter) {
+  const beatTime = (x) => {
+    const i = Math.floor(x), f = x - i;
+    if (i + 1 < beats.length) return beats[i] + (beats[i + 1] - beats[i]) * f;
+    const p = beats[beats.length - 1] - beats[beats.length - 2];
+    return beats[beats.length - 1] + p * (x - (beats.length - 1));
+  };
+  const refOf = (e) => { const v = []; for (let i = 0; i < e.length; i += 3) v.push(e[i]); return percentile(v, 0.97) || 1; };
+  const R = { k: refOf(env.k), s: refOf(env.s), h: refOf(env.h) };
+  return bars.map((bar) => {
+    if (bar.pickup || bar.n !== meter) return null;
+    const g = { k: [], s: [], h: [] };
+    for (let st = 0; st < meter * 4; st++) {
+      const t = beatTime(bar.b0 + st / 4) - ONSET_LAG;
+      for (const key of ['k', 's', 'h']) g[key].push(Math.round(Math.min(1, peakNear(env[key], fps, t, 0.025) / R[key]) * 100) / 100);
+    }
+    return g;
+  });
+}
+
+// ───────────────────────── 13. 楽器のメロディ（歌のない区間の、一番目立つ音の高さ・16 分ごと）
+// 歌っている 16 分（vocalLine に高さがある所）は除く。歌の息つぎの間に、ピアノ・ギターが入れるフレーズも拾う
+// 16 分ごとに「目立つ高さの候補」をいくつか持ち、なめらかにつながる道すじ（動的計画法）を選ぶ
+// （実際の曲では、一番目立つ音が楽器のあいだで入れかわるので、1 か所ずつ決めるとメロディが途切れる）
+function estimateLeadLine(A, beats, beatVocal, duration, vocalLine) {
+  const nb = beats.length, S = nb * 4;
+  const line = new Array(S).fill(-1);
+  const cand = new Array(S).fill(null);
+  const tops = [];
+  for (let i = 0; i < nb; i++) {
+    const t0 = beats[i], t1 = i + 1 < nb ? beats[i + 1] : duration;
+    for (let k = 0; k < 4; k++) {
+      const st = i * 4 + k;
+      if (beatVocal[i] && ((vocalLine[st] ?? -1) >= 0 || (vocalLine[st - 1] ?? -1) >= 0 || (vocalLine[st + 1] ?? -1) >= 0)) continue;
+      const a = t0 + ((t1 - t0) * (k + 0.25)) / 4 - ONSET_LAG, b = t0 + ((t1 - t0) * (k + 0.95)) / 4 - ONSET_LAG;
+      const votes = new Map();
+      let nf = 0;
+      for (let f = Math.max(0, Math.floor(a * A.fps)); f < Math.min(A.F, Math.ceil(b * A.fps)); f++) {
+        nf++;
+        for (let q = 0; q < A.TOPK; q++) {
+          const m = Math.round(A.melTopP[f * A.TOPK + q] - A.tuning / 100);
+          if (m < 55 || m > 96) continue;
+          votes.set(m, (votes.get(m) || 0) + A.melTopS[f * A.TOPK + q] * (q === 0 ? 1 : 0.7));
+        }
+      }
+      if (!nf || !votes.size) continue;
+      const list = [...votes.entries()].map(([m, v]) => [m, v / nf]).sort((x, y) => y[1] - x[1]).slice(0, 4);
+      cand[st] = list;
+      tops.push(list[0][1]);
+    }
+  }
+  if (!tops.length) return line;
+  const ref = percentile(tops, 0.8) || 1;
+  const REST = 0.42; // これより目立たない所は「休み」
+  // 動的計画法（候補＋休み）
+  let prev = null; // [{ m, score, back }]
+  const backs = new Array(S).fill(null);
+  for (let st = 0; st < S; st++) {
+    const cs = cand[st];
+    const states = [{ m: -1, e: REST }].concat(cs ? cs.map(([m, v]) => ({ m, e: Math.min(1.2, v / ref) })) : []);
+    if (!prev) { prev = states.map((x) => ({ m: x.m, score: x.e, back: -1 })); backs[st] = prev; continue; }
+    const cur = states.map((x) => {
+      let best = -Infinity, bi = 0;
+      prev.forEach((p, j) => {
+        let tr = 0;
+        if (x.m < 0 && p.m < 0) tr = 0;
+        else if (x.m < 0 || p.m < 0) tr = -0.25;
+        else { const d = Math.abs(x.m - p.m); tr = d === 0 ? 0.04 : -0.05 - 0.07 * Math.min(d, 12) - (d > 7 ? 0.3 : 0); }
+        const v = p.score + tr;
+        if (v > best) { best = v; bi = j; }
+      });
+      return { m: x.m, score: best + x.e, back: bi };
+    });
+    backs[st] = cur;
+    prev = cur;
+  }
+  let j = 0;
+  for (let q = 1; q < prev.length; q++) if (prev[q].score > prev[j].score) j = q;
+  for (let st = S - 1; st >= 0; st--) { const node = backs[st][j]; line[st] = node.m; j = node.back; if (j < 0) break; }
+  // 1 つだけの音を消し、1 つだけの休みをうめる
+  for (let st = 1; st + 1 < S; st++) {
+    if (line[st] >= 0 && line[st - 1] !== line[st] && line[st + 1] !== line[st] && (line[st - 1] < 0 || line[st + 1] < 0)) line[st] = -1;
+    else if (line[st] < 0 && line[st - 1] >= 0 && line[st - 1] === line[st + 1]) line[st] = line[st - 1];
+  }
+  return line;
+}
+
 // ───────────────────────── 全体
 export function analyze(input, opts = {}) {
   const progress = opts.progress || (() => {});
@@ -1124,7 +1219,7 @@ export function analyze(input, opts = {}) {
   progress('pitch', 0);
   const B = stageB(L, R, sr, A.tuning, progress);
   progress('beats', 0);
-  const { onset, lowOnset, bodyOnset } = onsetEnvelope(A);
+  const { onset, lowOnset, bodyOnset, highOnset } = onsetEnvelope(A);
   let beats, grid;
   if (opts.beats && opts.beats.length > 4) {
     // 画面の手直し（テンポ ×2・÷2・半拍ずらす）：前の拍の並びから作ったものをそのまま使う
@@ -1196,6 +1291,8 @@ export function analyze(input, opts = {}) {
     return c / bar.n >= 0.4;
   });
   const vocalLine = estimateVocalLine(A, beats, beatVocal, duration);
+  const leadLine = estimateLeadLine(A, beats, beatVocal, duration, vocalLine);
+  const groove = computeGroove(bars, beats, { k: lowOnset, s: bodyOnset, h: highOnset }, A.fps, meter);
   // 小節の特徴（音の色＋和音）
   const barEnergy = bars.map((bar) => {
     const f0 = Math.floor(bar.t0 * A.fps), f1 = Math.min(A.F, Math.ceil(bar.t1 * A.fps));
@@ -1243,6 +1340,8 @@ export function analyze(input, opts = {}) {
     beatEnergy: chroma.energy,
     vocalProb: Array.from(vprob),
     vocalLine,
+    leadLine,
+    groove,
     vocalSource: opts.listen ? 'ai' : 'fallback',
     barVocal,
     barEnergy,

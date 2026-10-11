@@ -77,6 +77,18 @@ function chooseRhythm(ctx, bars, opt) {
         const first = q.p.indexOf('x');
         if (first >= 1 && first <= 6) w += 1.2; else if (first === 0) w -= 0.3;
       }
+      // ドラム・ベースに合わせる：キック・スネアが強く鳴る 16 分に音の始まりが重なる形を好む
+      if (opt.grooveAt) {
+        const g = opt.grooveAt(bar.b0);
+        if (g) {
+          let on = 0, sum = 0;
+          for (let k = 0; k < 16; k++) {
+            const acc = 0.6 * g.k[k] + 0.7 * g.s[k] + 0.25 * g.h[k];
+            if (q.p[k] === 'x') { sum += acc; on++; }
+          }
+          if (on) w += (opt.grooveWeight ?? 3.2) * (sum / on - g.mean);
+        }
+      }
       // 同じリズムが 3 小節続かない（2 小節続いたら別の形へ）
       if (out.length >= 2 && out[out.length - 1] && out[out.length - 2] && out[out.length - 1].p === q.p && out[out.length - 2].p === q.p) w -= 3;
       else if (prev && prev.p === q.p) w -= 0.4;

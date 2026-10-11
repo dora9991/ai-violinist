@@ -1,5 +1,5 @@
 // AIバイオリニスト：画面の動き
-import { compose, setPhrases, phraseInfo, setLineModel, lineModelInfo, ROLE_LABEL, TYPE_LABEL, STYLES, LOW, HIGH } from './engine/compose.js';
+import { compose, setPhrases, phraseInfo, setLineModel, lineModelInfo, leadStrong, ROLE_LABEL, TYPE_LABEL, STYLES, LOW, HIGH } from './engine/compose.js';
 import { chordName, keyNameJa, keyNameTrad, halfShift, pcName } from './engine/analyze.js';
 import { loadViolin, makeViolinBus, scheduleViolin, renderMix, loudnessOf } from './engine/sampler.js';
 import { audioBufferToWav, notesToMidi, download } from './engine/files.js';
@@ -12,9 +12,9 @@ const MUTED = new URLSearchParams(location.search).has('mute');
 const FORCE_STATIC = document.querySelector('meta[name="vai-mode"]')?.content === 'static' || new URLSearchParams(location.search).has('static');
 // 歌の判定の「歌っている」とみなす境目（AI ごとに出す数字の大きさが違う）
 const VOCAL_TH = { mac: 0.15, yamnet: 0.008 }; // YAMNet は tests/calibrate-yamnet.cjs で Mac の判定と 93% 一致する値
-const ROLE_COLOR = { pad: '#7aa7d9', arp: '#9fd3f7', rhythm: '#a6d96a', counter: '#6cc5b0', solo: '#f0a64a', riff: '#e2685b', fill: '#b993e6', ending: '#e8cf77' };
+const ROLE_COLOR = { pad: '#7aa7d9', arp: '#9fd3f7', rhythm: '#a6d96a', counter: '#6cc5b0', solo: '#f0a64a', riff: '#e2685b', fill: '#b993e6', answer: '#d98ad6', copy: '#f2829f', double: '#ff9f80', ending: '#e8cf77' };
 const TYPE_COLOR = { intro: '#3b3550', verse: '#2b3a4f', pre: '#2f4656', chorus: '#55402c', inter: '#4d2e31', outro: '#3b3550' };
-const ROLE_SHORT = { rest: '休む', pad: 'そっと', arp: '分散和音', rhythm: '刻み', counter: '対旋律', solo: 'ソロ', riff: 'リフ' };
+const ROLE_SHORT = { rest: '休む', pad: 'そっと', arp: '分散和音', rhythm: '刻み', counter: '対旋律', answer: '掛け合い', double: 'メロディ', solo: 'ソロ', riff: 'リフ' };
 
 const S = {
   ctx: null, master: null, songGain: null, bus: null,
@@ -473,7 +473,7 @@ function drawTimeline() {
   g.globalAlpha = 1;
   // 凡例
   if (!$('legend').childElementCount) {
-    const items = [['pad', 'そっと伴奏（歌の裏）'], ['arp', '分散和音'], ['rhythm', '刻み'], ['counter', '対旋律'], ['solo', 'ソロ'], ['riff', 'リフのまね'], ['fill', '合いの手'], ['ending', '最後の音']];
+    const items = [['pad', 'そっと伴奏（歌の裏）'], ['arp', '分散和音'], ['rhythm', '刻み'], ['counter', '対旋律'], ['solo', 'ソロ'], ['riff', 'リフのまね'], ['double', '楽器のメロディを弾く'], ['copy', '楽器のフレーズをまねる'], ['answer', '掛け合い'], ['fill', '合いの手'], ['ending', '最後の音']];
     $('legend').replaceChildren(...items.map(([k, t]) => {
       const s = document.createElement('span');
       const i = document.createElement('i');
@@ -547,7 +547,7 @@ function renderSections() {
     row2.append(chip, info);
     const sel = document.createElement('select');
     const autoRole = S.settings.roles[i] ? null : p.role;
-    const opts = [['auto', `おまかせ（${ROLE_LABEL[autoRole || 'auto'] || ''}）`], ['rest', '休む'], ['pad', 'そっと伴奏（長い音）'], ['arp', '分散和音（アルペジオ）'], ['rhythm', '刻み（リズム）'], ['counter', '対旋律（動きのある伴奏）'], ['solo', 'ソロ'], ['riff', p.hasRiff ? 'リフをまねる' : 'リフをまねる（見つからず）']];
+    const opts = [['auto', `おまかせ（${ROLE_LABEL[autoRole || 'auto'] || ''}）`], ['rest', '休む'], ['pad', 'そっと伴奏（長い音）'], ['arp', '分散和音（アルペジオ）'], ['rhythm', '刻み（リズム）'], ['counter', '対旋律（動きのある伴奏）'], ['answer', '掛け合い（歌の息つぎに答える）'], ['double', s.vocal ? 'メロディを弾く（歌と同じ旋律）' : 'メロディを弾く（ギター・ピアノなどの旋律）'], ['solo', 'ソロ'], ['riff', p.hasRiff ? 'リフをまねる' : 'リフをまねる（見つからず）']];
     for (const [v, t] of opts) {
       const o = document.createElement('option');
       o.value = v;
@@ -581,6 +581,11 @@ function renderFound() {
       lines.push(`<p><b>くり返すフレーズ（リフ）</b>：${TYPE_LABEL[s.type]}${s.n} に ${r.periodBars}小節のくり返し（${r.notes.length}音・一致 ${Math.round(r.sim * 100)}%）${r.conf >= 0.55 ? ' → バイオリンでまねられます' : ''}</p>`);
     }
   } else lines.push('<p><b>リフ</b>：はっきりくり返すフレーズは見つかりませんでした</p>');
+  // ほかの楽器とのからみ
+  const leadSecs = inst.filter((s) => leadStrong(S.an, s));
+  if (an.groove && an.groove.some((g) => g)) lines.push('<p><b>ドラム・ベース</b>：小節ごとに、キック・スネア・ハイハットの入る 16 分を聞き取りました → 刻みはそこに乗せ、ソロ・対旋律もそのリズムに寄せて、強い所に軽くアクセントをつけます</p>');
+  lines.push(`<p><b>楽器のメロディ</b>：${leadSecs.length ? `${leadSecs.map((s) => `${TYPE_LABEL[s.type]}${s.n}`).join('、')} で、ギター・ピアノなどの目立つ旋律を聞き取りました → バイオリンが同じ旋律を弾きます（楽器が休む所は前後へつながる線でうめます）` : '歌のないところに、はっきりした楽器の旋律は見つかりませんでした（区間の役割で「メロディを弾く」も選べます）'}。歌の息つぎに楽器が入れるフレーズは、バイオリンでまねます</p>`);
+  if (S.an.vocalLine) lines.push('<p><b>掛け合い</b>：歌のフレーズが終わった息つぎで、その終わりの形をまねて答えます（サビは歌と同じメロディを重ねることもできます：区間の役割「メロディを弾く」）</p>');
   const keys = [];
   an.keyPerBar.forEach((k, i) => { if (!i || k.tonic !== an.keyPerBar[i - 1].tonic || k.mode !== an.keyPerBar[i - 1].mode) keys.push(`${keyNameTrad(k)}（${fmt(an.bars[i].t0)}〜）`); });
   lines.push(`<p><b>曲全体の調</b>：${keyNameJa(an.key)}（${keyNameTrad(an.key)}）${an.key.manual ? '　※手で指定' : ''}。コードとコードの間の音は、この調の音階から選び、原曲の音と半音でぶつかる音は使いません</p>`);
