@@ -45,6 +45,7 @@ function makeCtx(an, settings) {
     return beats[i + 1] - beats[i];
   };
   const bi = (x) => clamp(Math.floor(x + 1e-6), 0, nb - 1);
+  const beatOf = (t) => { let lo = 0, hi = nb - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (beats[m] <= t) lo = m; else hi = m; } return lo + (t - beats[lo]) / Math.max(1e-6, (beats[lo + 1] ?? beats[lo] + lastP) - beats[lo]); };
   // 和音（無いときは、その拍で鳴っている強い音）
   const chordPcs = (x) => {
     const i = bi(x);
@@ -121,9 +122,16 @@ function makeCtx(an, settings) {
     const k = clamp(step - bar.b0 * 4, 0, g.k.length - 1);
     return Math.min(1, 0.6 * g.k[k] + 0.7 * g.s[k] + 0.25 * g.h[k]);
   };
+  // 曲全体の歌の高さの真ん中（伴奏を歌の下に置くか上に置くかは、曲で 1 つに決める。区間ごとに変えると大きく跳ぶ）
+  let vocalMed = null, vocalLo = null, vocalHi = null;
+  if (VL) {
+    const vs = [];
+    for (let i = 0; i < VL.length; i++) if (VL[i] >= 0) vs.push(VL[i]);
+    if (vs.length >= 32) { vs.sort((a, b) => a - b); vocalMed = vs[vs.length >> 1]; vocalLo = vs[Math.floor(vs.length * 0.1)]; vocalHi = vs[Math.floor(vs.length * 0.9)]; }
+  }
   const LL = an.leadLine || null;
   const leadPitch = (step) => { if (!LL || step < 0 || step >= LL.length) return null; const v = LL[step]; return v >= 0 ? v : null; };
-  return { an, settings, rand, beatTime, beatLen, chordPcs: safeChordPcs, rawChordPcs: chordPcs, chordRoot, keyAt, scalePcs, tension, heard, clashes, vocalAt, vocalPitch, vocalState, nextVocalNote, hasVocalLine: !!VL, grooveAt: G ? grooveAt : null, accentAtStep, leadPitch, nb, style: STYLES[settings.style] || STYLES.emotional };
+  return { an, settings, rand, beatTime, beatOf, beatLen, chordPcs: safeChordPcs, rawChordPcs: chordPcs, chordRoot, keyAt, scalePcs, tension, heard, clashes, vocalAt, vocalPitch, vocalState, nextVocalNote, hasVocalLine: !!VL, vocalMed, vocalLo, vocalHi, grooveAt: G ? grooveAt : null, accentAtStep, leadPitch, nb, style: STYLES[settings.style] || STYLES.emotional };
 }
 
 // 区間の中の小節（拍の位置）
@@ -194,7 +202,73 @@ export function planRoles(an, settings) {
     if (role === 'riff' && !riff) role = 'solo';
     return { si, sec, role, intensity: clamp(intensity * (0.6 + 0.6 * presence), 0.1, 1), riff: riff || null, auto: !(over && over !== 'auto') };
   });
+  levelsOf(an, plan, presence);
   return plan;
+}
+
+// 区間ごとの強さの段階（0〜4）：最初は薄く低く、後ろほど足して高く、最後のサビが頂点。最後のサビより前に全力を出さない
+// （YouTube の弦アレンジ・バイオリン講座 61 本で、いちばん多く一致していたこと）
+//   0＝1番の Aメロ（低い長い音）／1＝2番の Aメロ・1番の Bメロ／2＝1回目のサビ・2番の Bメロ／3＝途中のサビ・間奏／4＝最後のサビ
+function levelsOf(an, plan, presence) {
+  const K = plan.filter((p) => p.sec.type === 'chorus').length;
+  let k = 0;
+  plan.forEach((p, i) => {
+    const t = p.sec.type;
+    p.prevType = i > 0 ? plan[i - 1].sec.type : null;
+    p.nextType = i + 1 < plan.length ? plan[i + 1].sec.type : null;
+    if (t === 'chorus') {
+      p.chorusK = k; p.chorusCount = K;
+      p.level = K === 1 ? 3 : k === K - 1 ? 4 : k === 0 ? 2 : 3;
+      k++;
+    } else if (t === 'verse') p.level = k === 0 ? 0 : 1;
+    else if (t === 'pre') p.level = k === 0 ? 1 : 2;
+    else if (t === 'inter') p.level = 3;
+    else if (t === 'intro') p.level = 1;
+    else p.level = 2;
+  });
+  // サビが見つからない曲（歌の大きさの差が小さい）：歌の区間の順番で、後ろほど少しずつ上げる（最後の 2 割はサビのつもりで対旋律）
+  if (!K) {
+    const voc = plan.filter((p) => p.sec.vocal);
+    voc.forEach((p, j) => {
+      const r = j / Math.max(1, voc.length - 1);
+      p.level = r < 0.25 ? 0 : r < 0.5 ? 1 : r < 0.8 ? 2 : 3;
+      if (p.level === 3 && p.auto && p.role === 'pad' && presence >= 0.45) p.role = 'counter';
+    });
+  }
+  // 歌の区間の強さ（音量）も段階に合わせる
+  for (const p of plan) if (p.sec.vocal) p.intensity = clamp([0.25, 0.38, 0.55, 0.72, 0.9][p.level] * (0.6 + 0.6 * presence), 0.1, 1);
+}
+
+// 区間の歌の高さ（10%・真ん中・90%）
+function vocalRangeOf(ctx, item) {
+  const an = ctx.an;
+  if (!an.vocalLine || !item.sec.vocal) return null;
+  const s0 = an.bars[item.sec.bar0].b0 * 4, s1 = (an.bars[item.sec.bar1 - 1].b0 + an.bars[item.sec.bar1 - 1].n) * 4;
+  const vs = [];
+  for (let st = s0; st < s1; st++) { const v = an.vocalLine[st]; if (v >= 0) vs.push(v); }
+  if (vs.length < 8) return null;
+  vs.sort((a, b) => a - b);
+  return { lo: vs[Math.floor(vs.length * 0.1)], med: vs[vs.length >> 1], hi: vs[Math.floor(vs.length * 0.9)] };
+}
+
+// バイオリンの音域：歌と同じ音域でかぶせない。歌の下で長い音（1番の Aメロは G 線・D 線のあたり）、
+// サビの対旋律は歌から離して上へ、サビのたびに少しずつ上げ、最後のサビがいちばん高い
+function registerFor(ctx, item, kind) {
+  const vr = vocalRangeOf(ctx, item);
+  const lv = item.level ?? 2;
+  if (kind === 'pad') {
+    const vLo = ctx.vocalLo, vHi = ctx.vocalHi;
+    if (vLo == null) { const hi = [69, 72, 76, 79, 81][lv]; return { lo: 55, hi, center: hi - 7 }; }
+    // 歌の下に 5 度以上の余地があれば、歌の下（G 線・D 線のあたり）で支える
+    if (vLo >= 64 && lv <= 2) { const hi = Math.max(60, Math.min(vLo - 1, 62 + 2 * lv)); return { lo: 55, hi, center: Math.round((55 + hi) / 2) + 1 }; }
+    // 余地がなければ歌の上で（どちらにするかは曲で 1 つに決まる。区間ごとに変えると大きく跳ぶ）
+    const lo = clamp(vHi + 1, 62, 80);
+    return { lo, hi: Math.min(88, lo + 10 + lv), center: lo + 3 + lv };
+  }
+  // 対旋律（サビ）
+  const med = vr ? vr.med : 70;
+  const center = lv <= 2 ? clamp(med + 5, 70, 79) : lv === 3 ? clamp(med + 9, 74, 84) : clamp(med + 12, 77, 86);
+  return { lo: lv <= 2 ? 62 : 66, hi: Math.min(lv >= 4 ? 93 : 89, center + 8), center };
 }
 
 // ───────────────────────── 和音のまとまり（区間の中）
@@ -227,9 +301,9 @@ const PC_ROLE_COST = (m, ctx, x) => {
   const iv = pcOf(m - root);
   if (iv === 3 || iv === 4) return 0; // 3度
   if (iv === 10 || iv === 11) return 0.1; // 7度
-  if (iv === 7) return 0.35; // 5度
-  if (iv === 0) return 0.55; // 根音
-  if (iv === 2) return 0.4; // 9度
+  if (iv === 7) return 0.4; // 5度
+  if (iv === 0) return 1.0; // 根音（ベースの役目。長い音・強拍では避ける）
+  if (iv === 2) return 0.3; // 9度
   return 0.6;
 };
 
@@ -240,14 +314,18 @@ function genPad(ctx, item, out, prevNote) {
   const bars = sectionBars(an, sec).filter((b) => !b.pickup);
   if (!bars.length) return prevNote;
   const inten = item.intensity;
-  const sparse = inten < 0.35;
-  const spans = chordSpans(ctx, bars, sparse ? 8 : 4);
-  const low = item.registerLow ?? (sec.type === 'pre' ? 69 : 67);
-  const high = item.registerHigh ?? (sec.type === 'pre' ? 86 : 83);
-  const center0 = (low + high) / 2;
-  // 1番の A メロなどは、後半から静かに入る
+  const lv = item.level ?? 2;
+  const sparse = lv === 0 && sec.n === 1;
+  const spans = chordSpans(ctx, bars, lv <= 1 ? 8 : 4);
+  // 音域：歌と同じ音域でかぶせない（1番の Aメロは G 線・D 線のあたりの低い長い音）
+  const reg = registerFor(ctx, item, 'pad');
+  const low = item.registerLow ?? reg.lo;
+  const high = item.registerHigh ?? (sec.type === 'pre' ? Math.min(86, reg.hi + 5) : reg.hi);
+  const center0 = reg.center;
+  // 1番の最初の Aメロは、後半から静かに入る（最初は薄く）
   let startIdx = 0;
   if (sparse && spans.length > 2) startIdx = Math.floor(spans.length / 2);
+  const dom = (ctx.keyAt(bars[0].b0).tonic + 7) % 12; // 調の 5 度（低い段階では、合う間はのばす土台にする）
   // 動的計画法で、なめらかに動く音の並びを選ぶ
   const cand = spans.map((sp, i) => {
     const list = [];
@@ -275,11 +353,12 @@ function genPad(ctx, item, out, prevNote) {
     for (let j = 0; j < cand[i].length; j++) {
       const m = cand[i][j];
       let local = PC_ROLE_COST(m, ctx, spans[i].x) + 0.07 * Math.abs(m - centerAt(i)) + rand() * 0.05;
-      // 歌とこすれない（歌の音と 2度でぶつかる長い音は避ける）
+      if (lv <= 1 && pcOf(m) === dom && pcOf(m - ctx.chordRoot(spans[i].x)) !== 0) local -= 0.2;
+      // 歌とこすれない（歌の音と 2度でぶつかる長い音は避ける）。歌と同じ音名（同じ高さ・オクターブ）も重ねない
       if (ctx.hasVocalLine) {
-        let rub = 0;
-        for (let k = 0; k < spans[i].len * 4; k++) { const v = ctx.vocalPitch(spans[i].x * 4 + k); if (v != null) { const d = Math.abs(m - v) % 12; if (d === 1 || d === 2 || d === 11 || d === 10) rub++; } }
-        local += 0.15 * rub;
+        let rub = 0, same = 0, cnt = 0;
+        for (let k = 0; k < spans[i].len * 4; k++) { const v = ctx.vocalPitch(spans[i].x * 4 + k); if (v != null) { cnt++; const d = Math.abs(m - v) % 12; if (d === 1 || d === 2 || d === 11 || d === 10) rub++; if (d === 0) same++; } }
+        local += 0.15 * rub + (cnt ? 0.8 * (same / cnt) : 0);
       }
       if (i === 0) {
         const from = prevNote ? prevNote.midi : Math.round(centerAt(0));
@@ -289,7 +368,8 @@ function genPad(ctx, item, out, prevNote) {
       for (let q = 0; q < cand[i - 1].length; q++) {
         const p = cand[i - 1][q];
         const iv = Math.abs(m - p);
-        let tc = iv === 0 ? 0.35 : iv <= 2 ? 0.05 : iv <= 4 ? 0.3 : iv <= 7 ? 1.2 : 3;
+        // 前後の和音に共通する音は、のばしたまま（動くなら半音・全音。跳ばない）
+        let tc = iv === 0 ? -0.05 : iv <= 2 ? 0.05 : iv <= 4 ? 0.3 : iv <= 7 ? 1.2 : 3;
         if (rising && m < p) tc += 0.5;
         // 学んだ「コードが変わる所のつながり」（例：次のコードの 4度にいた音は 3度へ）
         if (hasLineModel()) {
@@ -308,14 +388,19 @@ function genPad(ctx, item, out, prevNote) {
   for (let i = N - 1; i >= 0; i--) { pick[i] = cand[i][j]; j = back[i][j]; }
   const motion = ctx.settings.motion ?? 1;
   const unit = an.bpm >= 140 ? 1 : 0.5; // つなぎの音の長さ（拍）
+  const maxHold = Math.max(4, Math.min(8, Math.floor(6.5 / (60 / an.bpm)))); // 1 回の弓でのばせる長さ（拍）
   let last = prevNote;
+  let held = null, heldX = 0, heldLen = 0; // 共通音でのばしている音
   for (let i = startIdx; i < N; i++) {
     const sp = spans[i];
     const m = pick[i];
     const next = i + 1 < N ? pick[i + 1] : null;
     // 伴奏の動き「ほどよく」以上：次の和音の音へ、音階でつなぐ（例：ミ〜〜〜 レ↘ド）
     let approach = [];
-    if (motion >= 1 && next != null && next !== m && sp.len >= 2 && rand() < (motion >= 2 ? 0.8 : 0.55)) {
+    const xEndA = sp.x + sp.len;
+    let vocalMoves = false;
+    for (let st = Math.round((xEndA - 1) * 4); st < Math.round(xEndA * 4); st++) { const vs = ctx.vocalState(st); if (vs && vs.state === 'on') vocalMoves = true; }
+    if (motion >= 1 && next != null && next !== m && sp.len >= 2 && !vocalMoves && rand() < (motion >= 2 ? 0.8 : 0.55)) {
       const n2 = Math.min(2, Math.round(1 / unit));
       const xEnd = sp.x + sp.len;
       const dir = next > m ? -1 : 1; // 次の音へ、反対側から近づく
@@ -327,13 +412,28 @@ function genPad(ctx, item, out, prevNote) {
       if (ok) approach = seq.map((q, k) => ({ x: xEnd - (n2 - k) * unit, len: unit, midi: q }));
     }
     const mainLen = sp.len - approach.length * unit;
-    const t = ctx.beatTime(sp.x), te = ctx.beatTime(sp.x + mainLen);
-    // 同じ音が続くときは弓を返す（つなげず、やわらかく入り直す）
     const phrasePos = (i - startIdx) / Math.max(1, N - startIdx - 1);
     const vel = clamp(0.22 + 0.4 * inten + (rising ? 0.2 * phrasePos : 0.06 * Math.sin(Math.PI * phrasePos)), 0.15, 0.85);
-    const n = { t, d: te - t, midi: m, vel, art: te - t > 1.2 ? 'sneak' : 'sus', legato: !!last && last.midi !== m && Math.abs(last.t + last.d - t) < 0.05, shape: 'swell', role: 'pad', sec: item.si };
-    out.push(n);
-    last = n;
+    if (held && held.midi === m && heldLen + mainLen <= maxHold) {
+      // 前の和音と同じ音：弓を返さずにのばす（タイ）
+      heldLen += mainLen;
+      held.d = ctx.beatTime(heldX + heldLen) - held.t;
+    } else {
+      let x0 = sp.x, len0 = mainLen;
+      // 掛留：前の音が新しい和音でも濁らず（和音の外の音）、次の音のとなりなら、1 拍残してから解決する
+      if (held && motion >= 1 && len0 >= 2 && Math.abs(held.midi - m) <= 2 && !ctx.chordPcs(sp.x).includes(pcOf(held.midi)) && ctx.tension(held.midi, sp.x) <= 1 && ctx.tension(held.midi, sp.x + 0.75) <= 1 && rand() < 0.4) {
+        heldLen += 1;
+        held.d = ctx.beatTime(heldX + heldLen) - held.t;
+        held.vib = 1;
+        x0 += 1; len0 -= 1;
+      }
+      const t = ctx.beatTime(x0), te = ctx.beatTime(x0 + len0);
+      const n = { t, d: te - t, midi: m, vel, art: te - t > 1.2 ? 'sneak' : 'sus', legato: !!last && last.midi !== m && Math.abs(last.t + last.d - t) < 0.05, shape: 'swell', role: 'pad', sec: item.si };
+      out.push(n);
+      last = n;
+      held = n; heldX = x0; heldLen = len0;
+    }
+    if (approach.length) held = null;
     for (const a of approach) {
       const ta = ctx.beatTime(a.x), tb = ctx.beatTime(a.x + a.len);
       const an2 = { t: ta, d: tb - ta, midi: a.midi, vel: clamp(vel * 0.9, 0.15, 0.8), art: 'sus', legato: true, shape: 'flat', role: 'pad', sec: item.si };
@@ -357,6 +457,8 @@ function genArp(ctx, item, out, prevNote) {
   let last = prevNote;
   let k = 0;
   const inten = item.intensity;
+  // 1 番の Aメロなど低い段階は、弦をはじくピチカートで軽く（弓の分散和音と質感を変える）
+  const pizz = (item.level ?? 2) <= 1 && item.sec.vocal;
   for (const bar of bars) {
     for (let pos = 0; pos < bar.n - 1e-6; pos += unit, k++) {
       const x = bar.b0 + pos;
@@ -373,7 +475,9 @@ function genArp(ctx, item, out, prevNote) {
       const m = voicing[Math.min(voicing.length - 1, pat[k % pat.length])];
       const t = ctx.beatTime(x), te = ctx.beatTime(x + unit);
       const accent = pos === 0 ? 0.06 : 0;
-      const n = { t, d: (te - t) * 0.95, midi: m, vel: clamp(0.24 + 0.22 * inten + accent, 0.15, 0.6), art: 'sus', legato: pos > 0, shape: 'flat', role: 'arp', sec: item.si };
+      const n = pizz
+        ? { t, d: (te - t) * 0.95, midi: m, vel: clamp(0.36 + 0.22 * inten + accent, 0.2, 0.75), art: 'pizz', legato: false, shape: 'flat', role: 'arp', sec: item.si }
+        : { t, d: (te - t) * 0.95, midi: m, vel: clamp(0.24 + 0.22 * inten + accent, 0.15, 0.6), art: 'sus', legato: pos > 0, shape: 'flat', role: 'arp', sec: item.si };
       out.push(n);
       last = n;
     }
@@ -409,17 +513,26 @@ function genRhythm(ctx, item, out, prevNote) {
       if (picked.length >= 3) pat = picked;
     }
   }
+  const lvR = item.level ?? 2;
+  if (an.meter === 4 && lvR <= 1) pat = (rand() < 0.6 ? [2, 6, 10, 14] : [4, 12]); // 静かな所は裏拍（または 2・4 拍）だけ
+  else if (an.meter === 4 && lvR === 2 && !fast) pat = [0, 2, 4, 6, 8, 10, 12, 14];
   const rising = item.sec.type === 'pre';
   let m = prevNote ? clamp(prevNote.midi, 69, 81) : 74;
   let last = prevNote;
   bars.forEach((bar, bi) => {
-    pat.forEach((s16, k) => {
+    // 2 小節に 1 回、16 分を 1 つ足して押す（4 分・8 分を並べただけの機械的な刻みにしない）
+    let pb = pat;
+    if (bi % 2 === 1 && pat.length >= 2 && an.meter === 4) {
+      const lastS = pat[pat.length - 1];
+      if (lastS - 1 > pat[pat.length - 2]) pb = [...pat.slice(0, -1), lastS - 1, lastS];
+    }
+    pb.forEach((s16, k) => {
       const x = bar.b0 + s16 / 4;
       const pcs = ctx.chordPcs(x);
       if (!pcs.includes(pcOf(m))) m = nearestIn(m, pcs, 67, 84);
-      const nextS = k + 1 < pat.length ? pat[k + 1] : an.meter * 4;
+      const nextS = k + 1 < pb.length ? pb[k + 1] : an.meter * 4;
       const t = ctx.beatTime(x), te = ctx.beatTime(bar.b0 + nextS / 4);
-      const prog = (bi + k / pat.length) / bars.length;
+      const prog = (bi + k / pb.length) / bars.length;
       const vel = clamp((rising ? 0.28 + 0.4 * prog : 0.3 + 0.3 * item.intensity) + 0.12 * (ctx.accentAtStep(bar.b0 * 4 + s16) - 0.4), 0.15, 0.85);
       const n = { t, d: Math.min(te - t, ctx.beatLen(x) * 0.5) * 0.9, midi: m, vel, art: 'mrc', legato: false, shape: 'flat', role: 'rhythm', sec: item.si };
       out.push(n);
@@ -628,8 +741,8 @@ function nextTargetPitch(ctx, item, center) {
   return nearestIn(Math.round(center), pcs, 55, 91);
 }
 
-function genSoloLine(ctx, item, out, prevNote, nextIsVocal) {
-  const bars = barsOf(ctx, item);
+function genSoloLine(ctx, item, out, prevNote, nextIsVocal, onlyBars) {
+  const bars = onlyBars || barsOf(ctx, item);
   if (bars.length < 1) return prevNote;
   const sec = item.sec;
   const isIntro = sec.type === 'intro', isOutro = sec.type === 'outro';
@@ -650,6 +763,7 @@ function genSoloLine(ctx, item, out, prevNote, nextIsVocal) {
     phraseBars: motion === 2 ? 4 : 2, // 2〜4 小節ごとに息つぎ
     grooveAt: ctx.grooveAt,
     beam: 28,
+    motif: true, // 動機をくり返して組み立てる
   });
   if (!ln.length) return genSoloV3(ctx, item, out, prevNote, nextIsVocal, sectionBars(ctx.an, sec).filter((b) => !b.pickup));
   // 最後の音：次が歌でなければ長くのばして決める
@@ -663,38 +777,74 @@ function genSoloLine(ctx, item, out, prevNote, nextIsVocal) {
   return lastOut || prevNote;
 }
 
+// サビの入りの着地の音：和音の音（根音より 3 度・5 度）、歌と同じ音名・2度でこすれる音を避け、目安の高さに近い音
+function landingPitch(ctx, x, center, beats) {
+  const pcs = ctx.chordPcs(x);
+  let best = null, bs = Infinity;
+  for (let m = 60; m <= 91; m++) {
+    if (!pcs.includes(pcOf(m))) continue;
+    let ok = true;
+    for (let k = 0; k < beats; k += 0.5) if (ctx.tension(m, x + k) > 1) ok = false;
+    if (!ok) continue;
+    let c = 0.08 * Math.abs(m - center) + PC_ROLE_COST(m, ctx, x);
+    for (let k = 0; k < beats * 4; k++) {
+      const v = ctx.vocalPitch(Math.round(x * 4) + k);
+      if (v == null) continue;
+      const d = Math.abs(m - v) % 12;
+      if (d === 0) c += 0.15;
+      if (d === 1 || d === 2 || d === 10 || d === 11) c += 0.1;
+    }
+    if (c < bs) { bs = c; best = m; }
+  }
+  return best;
+}
+
 function genCounterLine(ctx, item, out, prevNote) {
-  const bars = barsOf(ctx, item);
+  let bars = barsOf(ctx, item);
   if (!bars.length) return prevNote;
   const motion = ctx.settings.motion ?? 1;
   const inten = item.intensity;
-  const dens = [[1, 3], [2, 5], [3, 8]][motion];
-  const N = bars.length;
-  const center = (p) => 75 + 4 * Math.sin(Math.PI * Math.min(1, p * 1.1));
-  // 歌っている最中は長くのばし、動くのは歌の息つぎで（弦のアレンジの基本）：歌の途中の短い音は、前の音にまとめる
+  const lv = item.level ?? 3;
+  // 音数：1 回目のサビは控えめ、最後のサビがいちばん動く
+  const dens = (lv <= 2 ? [[1, 2], [1, 3], [2, 5]] : lv === 3 ? [[1, 3], [2, 5], [3, 7]] : [[2, 4], [3, 7], [4, 10]])[motion];
+  const reg = registerFor(ctx, item, 'counter');
+  // サビの頭は 1 小節のばす音（駆け上がりの着地）。対旋律として動くのは 2 小節目から
+  let landing = null;
+  if (bars.length >= 4) {
+    const x = bars[0].b0;
+    const m = landingPitch(ctx, x, reg.center, 4);
+    if (m != null) {
+      const t = ctx.beatTime(x), te = ctx.beatTime(x + 4);
+      landing = { t, d: te - t, midi: m, vel: clamp(0.38 + 0.42 * inten, 0.2, 0.9), art: 'sus', legato: false, shape: 'swell', role: 'counter', sec: item.si, vib: 1 };
+      bars = bars.slice(1);
+    }
+  }
+  const center = (p) => reg.center + 3 * Math.sin(Math.PI * Math.min(1, p * 1.1));
+  // 歌が細かく動いている間はのばし、動くのは歌の息つぎと、歌が音をのばしている所で（弦のアレンジの基本）
   const shapeRhythm = (notes) => {
     if (!ctx.hasVocalLine) return notes;
     const out2 = [];
     for (const nt of notes) {
       const st = ctx.vocalState(nt.step);
-      const singing = st && st.state !== 'rest';
+      const singing = st && st.state === 'on';
       const prevNt = out2[out2.length - 1];
       if (singing && nt.len < 4 && prevNt && nt.step - (prevNt.step + prevNt.len) <= 1) { prevNt.len = nt.step + nt.len - prevNt.step; continue; }
       out2.push({ ...nt });
     }
     return out2;
   };
-  const ln = genLine(ctx, {
+  const ln = bars.length ? genLine(ctx, {
     kind: 'counter', bars, densityAt: () => dens, shapeRhythm,
-    lo: 67, hi: inten > 0.8 ? 89 : 86, center, prev: prevNote ? prevNote.midi : null,
+    lo: reg.lo, hi: reg.hi, center, prev: landing ? landing.midi : prevNote ? prevNote.midi : null,
     target: nextTargetPitch(ctx, item, center(1)),
     vocalPitch: ctx.vocalPitch, vocalState: ctx.hasVocalLine ? ctx.vocalState : null, fillWeight: 0.9, vocalWeight: 0.8,
-    endLong: true, phraseBars: 4, grooveAt: ctx.grooveAt, beam: 24,
-  });
-  if (!ln.length) return genCounter(ctx, item, out, prevNote);
+    endLong: true, phraseBars: 4, grooveAt: ctx.grooveAt, beam: 24, avoidRoot: 1.2,
+  }) : [];
+  if (!ln.length && !landing) return genCounter(ctx, item, out, prevNote);
   const notes = lineToNotes(ctx, item, ln, 'counter', (n, i) => 0.35 + 0.42 * inten + 0.08 * Math.sin((Math.PI * i) / Math.max(1, ln.length - 1)), { grooveAccent: true });
+  if (landing) out.push(landing);
   out.push(...notes);
-  return notes[notes.length - 1] || prevNote;
+  return notes[notes.length - 1] || landing || prevNote;
 }
 
 // 合いの手：歌の息つぎ（1.5 拍以上の休み）に、次に歌い出す音へつながる短いフレーズ
@@ -768,6 +918,7 @@ function addLineFills(ctx, item, out) {
       keep: (n) => n.step >= fa && n.step < fb,
       lo: 64, hi: 86, center: () => center, prev: before ? before.midi : null, target,
       vocalPitch: ctx.vocalPitch, vocalState: ctx.vocalState, fillWeight: 1.5, grooveAt: ctx.grooveAt, beam: 20,
+      penta: 0.35, endLong: true,
     });
     if (ln.length < 2) continue;
     // 歌い出しまでに終わる
@@ -797,7 +948,42 @@ function lineNotesFrom(ctx, get, s0, s1) {
   }
   return notes;
 }
+// 歌を音符どおりに重ねると、歌い手の細かいリズムとずれて「カラオケのガイド」になる。
+// 骨組みの音（拍の頭の長めの音）だけを、次の骨組みの音までのばして、歌の 1 オクターブ上で（高すぎれば 3度上のハモり）
+function genVocalDouble(ctx, item, out, prevNote) {
+  const bars = barsOf(ctx, item);
+  if (!bars.length) return prevNote;
+  const s0 = bars[0].b0 * 4, s1 = (bars[bars.length - 1].b0 + 4) * 4;
+  const src = lineNotesFrom(ctx, ctx.vocalPitch, s0, s1);
+  const sk = src.filter((n) => n.len >= 3 || (n.s % 4 === 0 && n.len >= 2));
+  if (sk.length < 3) return genCounterLine(ctx, item, out, prevNote);
+  const vr = vocalRangeOf(ctx, item) || { med: 70 };
+  const octave = vr.med + 12 <= 88;
+  const inten = item.intensity;
+  let last = prevNote;
+  sk.forEach((n, i) => {
+    const nx = sk[i + 1];
+    const end = Math.min(nx ? nx.s : s1, n.s + 16);
+    let m;
+    if (octave) m = n.m + 12;
+    else {
+      const sc = ctx.scalePcs(n.s / 4);
+      m = stepScale(stepScale(n.m, 1, sc), 1, sc);
+      if (m > 88) m -= 12;
+    }
+    m = clamp(m, LOW, HIGH);
+    if (ctx.tension(m, n.s / 4) > 1) return;
+    const t = ctx.beatTime(n.s / 4), te = ctx.beatTime(end / 4);
+    const note = { t, d: (te - t) * 0.97, midi: m, vel: clamp(0.4 + 0.35 * inten, 0.2, 0.85), art: 'sus', legato: !!(nx && end === nx.s), shape: end - n.s >= 6 ? 'swell' : 'flat', role: 'double', sec: item.si };
+    if (end - n.s >= 6) note.vib = 1;
+    out.push(note);
+    last = note;
+  });
+  return last;
+}
+
 function genDouble(ctx, item, out, prevNote) {
+  if (item.sec.vocal) return genVocalDouble(ctx, item, out, prevNote);
   const bars = barsOf(ctx, item);
   if (!bars.length) return prevNote;
   const s0 = bars[0].b0 * 4, s1 = (bars[bars.length - 1].b0 + 4) * 4;
@@ -877,7 +1063,10 @@ function echoPhrase(ctx, srcNotes, ga, gb, prevMidi, target) {
     tail.unshift(n);
   }
   if (tail.length < 2) return null;
-  const start = Math.max(ga + 1, ga + 2 - (ga % 2)); // 8 分の位置から入る
+  // 8 分の位置から入る。歌の最後の音が長い（1 拍以上）ときは、その音が切れる少し手前から（息つぎが始まってからでは遅い）
+  const lastV = srcNotes[srcNotes.length - 1];
+  const early = lastV && lastV.len >= 4 && lastV.s + lastV.len === ga;
+  const start = early ? (ga % 2 === 0 ? ga : ga - 1) : Math.max(ga + 1, ga + 2 - (ga % 2));
   const offs = tail.map((n) => n.s - tail[0].s);
   const span = offs[offs.length - 1] + Math.min(4, tail[tail.length - 1].len);
   if (start + span > gb - 1) return null;
@@ -1005,6 +1194,213 @@ function addEnding(ctx, out) {
   if (tEnd - t > 0.8) out.push({ t, d: tEnd - t, midi: m, vel: 0.5, art: 'sneak', legato: false, shape: 'fade', role: 'ending', vib: 1, sec: an.sections.length - 1 });
 }
 
+// ───────────────────────── 区間をまたぐ組み立て（YouTube の弦アレンジ講座から）
+// イントロ：調の 5 度（合わなければ主音）をトレモロでのばして「何かが始まる」予感を作り、旋律は途中から入る。
+// 和音に合わなくなった所だけ、近い和音の音へ動く
+function genIntroPedal(ctx, item, out, bars) {
+  const an = ctx.an;
+  const x0 = bars[0].b0, x1 = bars[bars.length - 1].b0 + bars[bars.length - 1].n;
+  const key = ctx.keyAt(x0);
+  let m = null;
+  for (const pc of [(key.tonic + 7) % 12, key.tonic]) {
+    const cand = nearestIn(74, [pc], 64, 81);
+    let bad = 0;
+    for (let x = x0; x < x1; x++) if (ctx.tension(cand, x) > 1) bad++;
+    if (bad <= (x1 - x0) * 0.25) { m = cand; break; }
+  }
+  if (m == null) return null;
+  const made = [];
+  for (let x = x0; x < x1;) {
+    let mm = m;
+    if (ctx.tension(mm, x) > 1) mm = nearestIn(m, ctx.chordPcs(x), 60, 84);
+    let len = 0;
+    while (len < 8 && x + len < x1 && ctx.tension(mm, x + len) <= 1) len++;
+    if (!len) len = 1;
+    const t = ctx.beatTime(x), te = ctx.beatTime(x + len);
+    const p = (x - x0) / Math.max(1, x1 - x0);
+    made.push({ t, d: te - t, midi: mm, vel: clamp(0.22 + 0.25 * p + 0.2 * item.intensity, 0.15, 0.65), art: an.bpm >= 60 ? 'trem' : 'sus', legato: false, shape: 'cresc', role: 'pad', sec: item.si });
+    x += len;
+  }
+  out.push(...made);
+  return made[made.length - 1] || null;
+}
+
+// Bメロの後半（サビの直前）：8 分のスタッカートで同じ音をくり返し、和音が変わるたびに上の和音の音へ上がって、だんだん強く。
+// ゆっくりの曲は、1 小節ずつ上がるトレモロ。最後の 1 拍はサビへの駆け上がりのためにあける
+function addPreBuild(ctx, plan, notes) {
+  const an = ctx.an;
+  plan.forEach((item) => {
+    if (item.sec.type !== 'pre' || item.nextType !== 'chorus' || !item.auto || !['pad', 'arp', 'rhythm'].includes(item.role)) return;
+    const bars = sectionBars(an, item.sec).filter((b) => !b.pickup && b.n === an.meter);
+    if (bars.length < 2) return;
+    const wb = bars.slice(bars.length >= 6 ? -2 : -1);
+    const x0 = wb[0].b0, x1 = wb[wb.length - 1].b0 + wb[wb.length - 1].n - 1;
+    if (x1 - x0 < 2) return;
+    const t0 = ctx.beatTime(x0);
+    for (let j = notes.length - 1; j >= 0; j--) {
+      const n = notes[j];
+      if (n.sec !== item.si) continue;
+      if (n.t >= t0 - 0.01) notes.splice(j, 1);
+      else if (n.t + n.d > t0) n.d = Math.max(0.1, t0 - n.t);
+    }
+    const before = notes.filter((n) => n.t < t0).pop();
+    const reg = registerFor(ctx, item, 'pad');
+    let m = nearestIn(before ? before.midi : reg.center, ctx.chordPcs(x0), 60, 84);
+    const up = (x) => { // 次の和音で、今の音より上のいちばん近い和音の音（歌と同じ音名は避ける）
+      const pcs = ctx.chordPcs(x);
+      for (let q = m + 1; q <= 88; q++) {
+        if (!pcs.includes(pcOf(q))) continue;
+        const v = ctx.vocalPitch(Math.round(x * 4));
+        if (v != null && pcOf(q - v) === 0 && q + 1 <= 88) continue;
+        return q;
+      }
+      return m;
+    };
+    const span = x1 - x0;
+    if (an.bpm < 85) {
+      wb.forEach((b, k) => {
+        const xa = b.b0, xb = Math.min(b.b0 + b.n, x1);
+        if (xb <= xa) return;
+        if (k) m = up(xa);
+        else if (!ctx.chordPcs(xa).includes(pcOf(m))) m = nearestIn(m, ctx.chordPcs(xa), 60, 86);
+        const t = ctx.beatTime(xa), te = ctx.beatTime(xb);
+        notes.push({ t, d: te - t, midi: m, vel: clamp(0.35 + 0.25 * ((xa - x0) / span) + 0.2 * item.intensity, 0.2, 0.85), art: 'trem', legato: false, shape: 'cresc', role: 'pad', sec: item.si });
+      });
+      return;
+    }
+    let lastKey = null;
+    for (let x = x0; x < x1 - 1e-6; x += 0.5) {
+      const key = ctx.chordPcs(x).join(',');
+      if (lastKey != null && key !== lastKey) m = up(x);
+      else if (!ctx.chordPcs(x).includes(pcOf(m))) m = nearestIn(m, ctx.chordPcs(x), 60, 88);
+      lastKey = key;
+      const t = ctx.beatTime(x), te = ctx.beatTime(x + 0.5);
+      const p = (x - x0) / span;
+      notes.push({ t, d: (te - t) * 0.55, midi: m, vel: clamp(0.32 + 0.38 * p + 0.15 * item.intensity + (x % 1 === 0 ? 0.04 : 0), 0.2, 0.9), art: 'sus', legato: false, shape: 'flat', role: 'rhythm', sec: item.si });
+    }
+  });
+}
+
+// サビが終わって次の区間へ：急に切らず、中ほどの音を 2 拍のばして消えていく。次の区間は 1 拍目を休んで後から入る
+function addTails(ctx, plan, notes) {
+  const an = ctx.an;
+  plan.forEach((item, i) => {
+    if (item.sec.type !== 'chorus' || i + 1 >= plan.length) return;
+    const nx = plan[i + 1];
+    if (nx.sec.type === 'chorus' || nx.role === 'rest') return;
+    const xB = an.bars[nx.sec.bar0].b0, tB = ctx.beatTime(xB);
+    const mine = notes.filter((n) => n.sec === i && n.t < tB).sort((a, b) => a.t - b.t);
+    const lastN = mine[mine.length - 1];
+    if (!lastN || lastN.t + lastN.d < tB - ctx.beatLen(xB - 1) * 1.05) return;
+    const tailBeats = 2;
+    const tEnd = ctx.beatTime(xB + tailBeats);
+    for (let j = notes.length - 1; j >= 0; j--) {
+      const n = notes[j];
+      if (n.sec !== i + 1 || n.t < tB - 0.01 || n.t >= tEnd - 0.01) continue;
+      if (n.t + n.d > tEnd + 0.3) { n.d -= tEnd - n.t; n.t = tEnd; } else notes.splice(j, 1);
+    }
+    let fits = true;
+    for (let k = 0; k < tailBeats; k += 0.5) if (ctx.tension(lastN.midi, xB + k) > 1) fits = false;
+    if (fits) { lastN.d = tEnd - lastN.t; lastN.shape = 'fade'; return; }
+    lastN.d = Math.max(0.1, tB - lastN.t);
+    notes.push({ t: tB, d: tEnd - tB, midi: nearestIn(lastN.midi, ctx.chordPcs(xB), 60, 79), vel: clamp(lastN.vel * 0.8, 0.15, 0.8), art: 'sus', legato: true, shape: 'fade', role: 'pad', sec: i + 1 });
+  });
+}
+
+// サビの頭への駆け上がり：着地はサビの 1 拍目。最後の 1 拍（ゆっくりの曲は 2 拍）に、着地の音の下から音階で 5〜7 音（偶数の
+// 16 分はそろいすぎて機械的なので、5・6・7 連符）。最後のサビの前は半音階。頭の 1 音にアクセント、だんだん強く。歌が休んでいる所だけ
+function addRunUps(ctx, plan, notes) {
+  const an = ctx.an;
+  plan.forEach((item, i) => {
+    if (item.sec.type !== 'chorus' || i === 0 || plan[i - 1].sec.type === 'chorus' || item.role === 'rest') return;
+    const xLand = an.bars[item.sec.bar0].b0;
+    const beats = an.bpm < 90 ? 2 : 1;
+    if (xLand - beats < 1) return;
+    const busyIn = (a, b) => { let c = 0; for (let st = Math.round(a * 4); st < Math.round(b * 4); st++) if (ctx.vocalPitch(st) != null) c++; return c; };
+    // 歌っている所には入れない。歌がサビの頭の少し前から歌い出す（アウフタクト）なら、1 拍早く駆け上がって、歌い出しの間はのばして待つ
+    let xEnd = xLand;
+    if (busyIn(xLand - beats, xLand) > beats) {
+      if (xLand - beats - 1 < 1 || busyIn(xLand - beats - 1, xLand - 1) > beats) return;
+      xEnd = xLand - 1;
+    }
+    const tLand = ctx.beatTime(xLand), tStart = ctx.beatTime(xEnd - beats), tEndRun = ctx.beatTime(xEnd);
+    let land = notes.find((n) => n.sec === i && Math.abs(n.t - tLand) < 0.08);
+    if (!land) {
+      const m = landingPitch(ctx, xLand, registerFor(ctx, item, 'counter').center, 2);
+      if (m == null) return;
+      const nextN = notes.filter((n) => n.sec === i && n.t > tLand + 0.05).sort((a, b) => a.t - b.t)[0];
+      const tEnd = Math.min(nextN ? nextN.t : Infinity, ctx.beatTime(xLand + 2));
+      land = { t: tLand, d: tEnd - tLand, midi: m, vel: clamp(0.4 + 0.4 * item.intensity, 0.3, 0.9), art: 'sus', legato: true, shape: 'swell', role: 'counter', sec: i, vib: 1 };
+      notes.push(land);
+    }
+    land.legato = true;
+    land.vib = 1;
+    // 歌い出しを待つ音（いまの和音の音で、着地の音のすぐ下か同じ高さ）
+    let hold = null;
+    if (xEnd < xLand) {
+      let h = null;
+      for (let q = land.midi; q >= land.midi - 5 && h == null; q--) {
+        if (!ctx.chordPcs(xEnd).includes(pcOf(q))) continue;
+        let okq = true;
+        for (let k = 0; k < xLand - xEnd; k += 0.5) if (ctx.tension(q, xEnd + k) > 1) okq = false;
+        const v = ctx.vocalPitch(Math.round(xEnd * 4) + 2);
+        if (v != null && Math.abs(q - v) % 12 <= 2) okq = false;
+        if (okq) h = q;
+      }
+      if (h == null) return;
+      hold = h;
+    }
+    const top = hold ?? land.midi;
+    const count = beats === 2 ? 9 : an.bpm >= 150 ? 5 : an.bpm >= 115 ? 6 : 7;
+    const seq = [];
+    if ((item.level ?? 3) >= 4) {
+      for (let k = count; k >= 1; k--) seq.push(top - k); // 半音階
+    } else {
+      const sc = ctx.scalePcs(xEnd - 0.5);
+      for (let q = top - 1; q > top - 24 && seq.length < count; q--) if (sc.includes(pcOf(q))) seq.unshift(q);
+    }
+    while (seq.length && seq[0] < LOW) seq.shift();
+    if (seq.length < 4) return;
+    for (let j = notes.length - 1; j >= 0; j--) {
+      const n = notes[j];
+      if (n === land) continue;
+      if (n.t >= tStart - 0.01 && n.t < tLand - 0.01) notes.splice(j, 1);
+      else if (n.t < tStart && n.t + n.d > tStart) n.d = Math.max(0.08, tStart - n.t);
+    }
+    const step = (tEndRun - tStart) / seq.length;
+    seq.forEach((m, k) => notes.push({ t: tStart + k * step, d: step * 0.96, midi: m, vel: clamp(0.45 + 0.3 * (k / Math.max(1, seq.length - 1)) + 0.15 * item.intensity + (k === 0 ? 0.08 : 0), 0.3, 0.95), art: k === 0 ? 'mrc' : 'sus', legato: k > 0, shape: 'flat', role: 'run', sec: i - 1 }));
+    if (hold != null) notes.push({ t: tEndRun, d: tLand - tEndRun, midi: hold, vel: clamp(0.5 + 0.2 * item.intensity, 0.3, 0.9), art: 'sus', legato: true, shape: 'flat', role: 'counter', sec: i - 1 });
+  });
+}
+
+// 重音（2 本の弦を同時に）：最後のサビの山場の長い音と、曲の最後の音に、3度か6度下を添える（バイオリン 1 本で厚みを出す。
+// 5度の重音は独奏では弱く音程も不安定なので使わない）。原曲・歌と濁る音は添えない
+function addDoubleStops(ctx, plan, notes) {
+  const cand = [];
+  const lastCh = plan.filter((p) => p.sec.type === 'chorus').pop();
+  if (lastCh && (lastCh.level ?? 0) >= 4) {
+    const longs = notes.filter((n) => n.sec === lastCh.si && n.role === 'counter' && n.d >= ctx.beatLen(ctx.beatOf(n.t)) * 1.8);
+    longs.sort((a, b) => b.midi - a.midi);
+    cand.push(...longs.slice(0, 2));
+  }
+  const end = notes.find((n) => n.role === 'ending');
+  if (end) cand.push(end);
+  for (const n of cand) {
+    const x = ctx.beatOf(n.t), xe = ctx.beatOf(n.t + n.d);
+    const sc = ctx.scalePcs(x);
+    for (const steps of [5, 2]) { // 6度下 → 3度下
+      let q = n.midi;
+      for (let k = 0; k < steps; k++) q = stepScale(q, -1, sc);
+      const iv = n.midi - q;
+      if (q < LOW || ![3, 4, 8, 9].includes(iv)) continue;
+      let ok = true;
+      for (let k = x; k < xe - 0.01; k += 0.5) if (ctx.tension(q, k) > 1) ok = false;
+      for (let st = Math.round(x * 4); st < Math.round(xe * 4) && ok; st++) { const v = ctx.vocalPitch(st); if (v != null && [0, 1, 2, 10, 11].includes(Math.abs(q - v) % 12)) ok = false; }
+      if (ok) { n.dbl = q; break; }
+    }
+  }
+}
+
 // ───────────────────────── 仕上げ
 function finalize(ctx, notes) {
   const { rand } = ctx;
@@ -1020,6 +1416,8 @@ function finalize(ctx, notes) {
   for (let i = 0; i + 1 < notes.length; i++) {
     const a = notes[i], b = notes[i + 1];
     if (a.t + a.d > b.t) a.d = Math.max(0.04, b.t - a.t);
+    // 区間の境目で大きく跳ぶときは、つなげずに息つぎ（休み）を入れる
+    if (a.sec !== b.sec && Math.abs(a.midi - b.midi) > 9 && b.t - (a.t + a.d) < 0.15 && a.d > 0.5) { a.d = Math.max(0.3, Math.min(a.d - 0.15, b.t - a.t - 0.2)); b.legato = false; }
     // 前の音とすき間なく続き、高さが違えば、なめらかにつなぐ
     if (b.t - (a.t + a.d) > 0.08) b.legato = false;
   }
@@ -1047,11 +1445,19 @@ export function compose(an, settings = {}) {
       case 'counter':
         prev = hasLineModel() && an.meter === 4 ? genCounterLine(ctx, item, notes, prev) : genCounter(ctx, item, notes, prev);
         break;
-      case 'solo':
+      case 'solo': {
+        // イントロ（4 小節以上）：前半は保続音（トレモロ）、旋律は後半から
+        const sb = barsOf(ctx, item);
+        if (item.sec.type === 'intro' && item.auto && sb.length >= 4 && hasLineModel() && an.meter === 4) {
+          const half = Math.floor(sb.length / 2);
+          const p0 = genIntroPedal(ctx, item, notes, sb.slice(0, half));
+          if (p0) { prev = genSoloLine(ctx, item, notes, p0, nextVocal, sb.slice(half)); break; }
+        }
         prev = hasLineModel() && an.meter === 4
           ? genSoloLine(ctx, item, notes, prev, nextVocal)
           : genSoloV3(ctx, item, notes, prev, nextVocal, sectionBars(an, item.sec).filter((b) => !b.pickup));
         break;
+      }
       case 'arp':
         prev = genArp(ctx, item, notes, prev);
         break;
@@ -1073,7 +1479,14 @@ export function compose(an, settings = {}) {
     }
     item.noteCount = notes.length - start;
   });
+  // 区間をまたぐ組み立て：Bメロ後半の押し上げ → サビ明けの伸ばし → サビへの駆け上がり
+  if (settings.arrange !== false) {
+    addPreBuild(ctx, plan, notes);
+    addTails(ctx, plan, notes);
+    addRunUps(ctx, plan, notes);
+  }
   if (settings.ending !== false) addEnding(ctx, notes);
+  if (settings.arrange !== false) addDoubleStops(ctx, plan, notes);
   const out = finalize(ctx, notes);
   return { notes: out, plan: plan.map((p) => ({ si: p.si, role: p.role, auto: p.auto, intensity: p.intensity, type: p.sec.type, n: p.sec.n, noteCount: p.noteCount, hasRiff: !!p.riff })) };
 }

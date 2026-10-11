@@ -15,7 +15,8 @@ export async function loadViolin(ctx, base = '/samples/', onProgress) {
     }),
   );
   const byArt = {};
-  // Logic の音：sus / sneak / mrc。フリーの音（VSCO）：arco-p / arco-f（弱・強）と spic-v1 / spic-v2（短い音）
+  // Logic の音：sus / sneak / mrc。フリーの音（VSCO）：arco-p / arco-f（弱・強）と spic-v1 / spic-v2（短い音）、
+  // pizz-f（ピチカート）、trem-v1 / trem-v2（トレモロ）
   for (const s of samples) (byArt[s.layer ? `${s.art}-${s.layer}` : s.art] ||= []).push(s);
   for (const k in byArt) byArt[k].sort((a, b) => a.midi - b.midi);
   return { man, samples, byArt, kind: man.kind || 'logic', rr: 0 };
@@ -31,13 +32,17 @@ function nearest(list, midi, violin) {
 function pickSample(violin, art, midi, n, legatoIn) {
   if (violin.kind === 'vsco') {
     const B = violin.byArt;
+    // ピチカート（はじく）・トレモロ（弓をこまかく往復）
+    if (art === 'pizz' && B['pizz-f']) return nearest(B['pizz-f'], midi, violin);
+    if (art === 'trem' && (B['trem-v1'] || B['trem-v2'])) return nearest((n.vel < 0.5 ? B['trem-v1'] : B['trem-v2']) || B['trem-v1'] || B['trem-v2'], midi, violin);
     // 短く切る音（刻み・はねる音）は spiccato の録音
     const short = !legatoIn && !n.legato && (n.d < 0.2 || (n.role === 'rhythm' && n.d < 0.4));
     if (short && B['spic-v1']) return nearest(n.vel < 0.5 ? B['spic-v1'] : B['spic-v2'] || B['spic-v1'], midi, violin);
     const soft = art === 'sneak' || (art !== 'mrc' && n.vel < 0.5);
     return nearest((soft ? B['arco-p'] : B['arco-f']) || B['arco-p'] || B['arco-f'], midi, violin);
   }
-  const list = violin.byArt[art] || violin.byArt.sus;
+  // Logic の音にはピチカート・トレモロがないので、短い音（mrc）と長い音（sus）で代わりに鳴らす
+  const list = violin.byArt[art === 'pizz' ? 'mrc' : art === 'trem' ? 'sus' : art] || violin.byArt.sus;
   let best = list[0];
   for (const s of list) if (Math.abs(s.midi - midi) < Math.abs(best.midi - midi)) best = s;
   return best;
@@ -118,82 +123,100 @@ export function scheduleViolin(ctx, violin, notes, dest, opt = {}) {
     const legatoIn = !!(n.legato && i > 0 && n.t - (notes[i - 1].t + notes[i - 1].d) < 0.03);
     let art = n.art || 'sus';
     if (legatoIn && art === 'sneak') art = 'sus';
-    const s = pickSample(violin, art, n.midi, n, legatoIn);
-    const looped = s.loopStart != null && s.loopEnd != null;
-    const rate = Math.pow(2, (n.midi - s.midi) / 12 + (tuning - s.cents) / 1200);
-    // 時刻
-    let t0 = songStart + n.t;
-    let offset = 0;
-    if (legatoIn && art !== 'mrc' && looped) offset = Math.min(0.2, s.loopStart * 0.5); // 弓を返さずにつなぐ：立ち上がりを飛ばす
-    const lateBy = from - n.t;
-    if (lateBy > 0) { t0 = songStart + from; offset += lateBy * rate; }
-    if (looped && offset > s.loopStart) offset = s.loopStart + ((offset - s.loopStart) % (s.loopEnd - s.loopStart));
-    if (!looped && offset >= s.buffer.duration - 0.02) continue;
-    const dur = Math.max(0.03, n.d - Math.max(0, lateBy));
-    const tEnd = t0 + dur;
-    const src = ctx.createBufferSource();
-    src.buffer = s.buffer;
-    src.loop = looped;
-    if (looped) { src.loopStart = s.loopStart; src.loopEnd = s.loopEnd; }
-    const pr = src.playbackRate;
-    pr.setValueAtTime(rate, t0);
-    if (lateBy <= 0) {
-      if (n.bend) {
-        // チョーキングのように、下からゆっくりずり上げる
-        pr.setValueAtTime(rate * Math.pow(2, -n.bend / 12), t0);
-        pr.linearRampToValueAtTime(rate, t0 + Math.min(0.17, dur * 0.45));
-      } else if (n.slide) {
-        pr.setValueAtTime(rate * Math.pow(2, n.slide / 12), t0);
-        pr.exponentialRampToValueAtTime(rate, t0 + Math.min(0.11, dur * 0.4));
-      } else if (n.grace) {
-        pr.setValueAtTime(rate * Math.pow(2, n.grace / 12), t0);
-        pr.setValueAtTime(rate, t0 + Math.min(0.05, dur * 0.3));
+    // 重音（n.dbl）：同じ弓で 2 本の弦を鳴らす。下の音は少し小さく
+    const voices = n.dbl != null ? [[n.midi, 1], [n.dbl, 0.8]] : [[n.midi, 1]];
+    for (const [vMidi, vMul] of voices) {
+      const s = pickSample(violin, art, vMidi, n, legatoIn);
+      const looped = s.loopStart != null && s.loopEnd != null;
+      const pizz = art === 'pizz';
+      const fakeTrem = art === 'trem' && s.art !== 'trem'; // トレモロの録音がない音源では、音量をこまかくゆらして近づける
+      const rate = Math.pow(2, (vMidi - s.midi) / 12 + (tuning - s.cents) / 1200);
+      // 時刻
+      let t0 = songStart + n.t;
+      let offset = 0;
+      if (legatoIn && art !== 'mrc' && looped) offset = Math.min(0.2, s.loopStart * 0.5); // 弓を返さずにつなぐ：立ち上がりを飛ばす
+      const lateBy = from - n.t;
+      if (lateBy > 0) { t0 = songStart + from; offset += lateBy * rate; }
+      if (looped && offset > s.loopStart) offset = s.loopStart + ((offset - s.loopStart) % (s.loopEnd - s.loopStart));
+      if (!looped && offset >= s.buffer.duration - 0.02) continue;
+      let dur = Math.max(0.03, n.d - Math.max(0, lateBy));
+      // ピチカートは、はじいた音が自然に消えるまで（次の音まで）鳴らす
+      if (pizz) dur = Math.min(Math.max(dur, 0.35), s.art === 'pizz' ? (s.buffer.duration - offset) / rate : 0.18);
+      const tEnd = t0 + dur;
+      const src = ctx.createBufferSource();
+      src.buffer = s.buffer;
+      src.loop = looped;
+      if (looped) { src.loopStart = s.loopStart; src.loopEnd = s.loopEnd; }
+      const pr = src.playbackRate;
+      pr.setValueAtTime(rate, t0);
+      if (lateBy <= 0 && !pizz) {
+        if (n.bend) {
+          // チョーキングのように、下からゆっくりずり上げる
+          pr.setValueAtTime(rate * Math.pow(2, -n.bend / 12), t0);
+          pr.linearRampToValueAtTime(rate, t0 + Math.min(0.17, dur * 0.45));
+        } else if (n.slide) {
+          pr.setValueAtTime(rate * Math.pow(2, n.slide / 12), t0);
+          pr.exponentialRampToValueAtTime(rate, t0 + Math.min(0.11, dur * 0.4));
+        } else if (n.grace) {
+          pr.setValueAtTime(rate * Math.pow(2, n.grace / 12), t0);
+          pr.setValueAtTime(rate, t0 + Math.min(0.05, dur * 0.3));
+        }
+        if (n.trill && dur > 0.5) {
+          const up = rate * Math.pow(2, n.trill / 12);
+          let k = 0;
+          for (let t = t0 + dur * 0.3; t < tEnd - 0.1; t += 0.068, k++) pr.setValueAtTime(k % 2 ? rate : up, t);
+          pr.setValueAtTime(rate, tEnd - 0.1);
+        }
       }
-      if (n.trill && dur > 0.5) {
-        const up = rate * Math.pow(2, n.trill / 12);
-        let k = 0;
-        for (let t = t0 + dur * 0.3; t < tEnd - 0.1; t += 0.068, k++) pr.setValueAtTime(k % 2 ? rate : up, t);
-        pr.setValueAtTime(rate, tEnd - 0.1);
+      // 明るさ（弱い音ほど暗く）
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 1800 + 9500 * Math.pow(n.vel, 1.5);
+      lp.Q.value = 0.6;
+      const g = ctx.createGain();
+      const level = s.gain * velAmp(n.vel) * (opt.level ?? 1) * vMul;
+      const attack = pizz ? 0.002 : legatoIn ? 0.045 : art === 'mrc' || s.art === 'spic' ? 0.004 : art === 'sneak' ? 0.02 : 0.02;
+      const gp = g.gain;
+      gp.setValueAtTime(0, t0);
+      const startK = n.shape === 'swell' && dur > 0.6 ? 0.62 : n.shape === 'cresc' && dur > 0.4 ? 0.45 : 1; // 山なり・だんだん強くは、小さく入る
+      gp.linearRampToValueAtTime(level * startK, t0 + attack);
+      if (n.shape === 'swell' && dur > 0.6) {
+        // 長い音は、小さく入ってふくらみ、少しおさめる（弦の打ち込みでいちばん効く、と多くの講座が言う山なりの抑揚）
+        gp.linearRampToValueAtTime(level * 1.05, t0 + dur * 0.55);
+        gp.linearRampToValueAtTime(level * 0.8, tEnd);
+      } else if (n.shape === 'cresc' && dur > 0.4) {
+        // だんだん強く（Bメロの終わり・イントロの保続音）
+        gp.linearRampToValueAtTime(level * 1.15, tEnd);
+      } else if (n.shape === 'fade') {
+        gp.setValueAtTime(level, t0 + Math.min(dur * 0.25, 0.6));
+        gp.exponentialRampToValueAtTime(Math.max(1e-4, level * 0.03), tEnd);
+      } else {
+        gp.setValueAtTime(level, Math.max(t0 + attack, tEnd - 0.01));
       }
+      if (fakeTrem && dur > 0.3) {
+        // 1 秒に 13 回ほど、音量を 0.55〜1 倍でゆらす
+        for (let t = t0 + attack, k = 0; t < tEnd - 0.04; t += 0.038, k++) gp.setValueAtTime(level * (k % 2 ? 0.55 : 1), t);
+        gp.setValueAtTime(level, tEnd - 0.04);
+      }
+      const tau = pizz ? 0.05 : nextLegato ? 0.03 : dur < 0.3 ? 0.06 : 0.13;
+      gp.setTargetAtTime(0, tEnd, tau);
+      src.connect(lp).connect(g).connect(dest);
+      // 頂点などはビブラートを少し足す
+      let osc = null;
+      if (n.vib && dur > 0.6 && !pizz) {
+        osc = ctx.createOscillator();
+        osc.frequency.value = 5.6;
+        const vg = ctx.createGain();
+        vg.gain.setValueAtTime(0, t0);
+        vg.gain.linearRampToValueAtTime(rate * 0.008, t0 + Math.min(0.7, dur * 0.5));
+        osc.connect(vg).connect(pr);
+        osc.start(t0);
+        osc.stop(tEnd + tau * 7);
+      }
+      src.start(t0, offset);
+      src.stop(tEnd + tau * 7);
+      nodes.push({ src, g, osc });
     }
-    // 明るさ（弱い音ほど暗く）
-    const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = 1800 + 9500 * Math.pow(n.vel, 1.5);
-    lp.Q.value = 0.6;
-    const g = ctx.createGain();
-    const level = s.gain * velAmp(n.vel) * (opt.level ?? 1);
-    const attack = legatoIn ? 0.045 : art === 'mrc' || s.art === 'spic' ? 0.004 : art === 'sneak' ? 0.02 : 0.02;
-    const gp = g.gain;
-    gp.setValueAtTime(0, t0);
-    gp.linearRampToValueAtTime(level, t0 + attack);
-    if (n.shape === 'swell' && dur > 0.6) {
-      gp.linearRampToValueAtTime(level * 1.1, t0 + dur * 0.45);
-      gp.linearRampToValueAtTime(level * 0.82, tEnd);
-    } else if (n.shape === 'fade') {
-      gp.setValueAtTime(level, t0 + Math.min(dur * 0.25, 0.6));
-      gp.exponentialRampToValueAtTime(Math.max(1e-4, level * 0.03), tEnd);
-    } else {
-      gp.setValueAtTime(level, Math.max(t0 + attack, tEnd - 0.01));
-    }
-    const tau = nextLegato ? 0.03 : dur < 0.3 ? 0.06 : 0.13;
-    gp.setTargetAtTime(0, tEnd, tau);
-    src.connect(lp).connect(g).connect(dest);
-    // 頂点などはビブラートを少し足す
-    let osc = null;
-    if (n.vib && dur > 0.6) {
-      osc = ctx.createOscillator();
-      osc.frequency.value = 5.6;
-      const vg = ctx.createGain();
-      vg.gain.setValueAtTime(0, t0);
-      vg.gain.linearRampToValueAtTime(rate * 0.008, t0 + Math.min(0.7, dur * 0.5));
-      osc.connect(vg).connect(pr);
-      osc.start(t0);
-      osc.stop(tEnd + tau * 7);
-    }
-    src.start(t0, offset);
-    src.stop(tEnd + tau * 7);
-    nodes.push({ src, g, osc });
   }
   return {
     stop() {

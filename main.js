@@ -12,7 +12,7 @@ const MUTED = new URLSearchParams(location.search).has('mute');
 const FORCE_STATIC = document.querySelector('meta[name="vai-mode"]')?.content === 'static' || new URLSearchParams(location.search).has('static');
 // 歌の判定の「歌っている」とみなす境目（AI ごとに出す数字の大きさが違う）
 const VOCAL_TH = { mac: 0.15, yamnet: 0.008 }; // YAMNet は tests/calibrate-yamnet.cjs で Mac の判定と 93% 一致する値
-const ROLE_COLOR = { pad: '#7aa7d9', arp: '#9fd3f7', rhythm: '#a6d96a', counter: '#6cc5b0', solo: '#f0a64a', riff: '#e2685b', fill: '#b993e6', answer: '#d98ad6', copy: '#f2829f', double: '#ff9f80', ending: '#e8cf77' };
+const ROLE_COLOR = { pad: '#7aa7d9', arp: '#9fd3f7', rhythm: '#a6d96a', counter: '#6cc5b0', solo: '#f0a64a', riff: '#e2685b', fill: '#b993e6', answer: '#d98ad6', copy: '#f2829f', double: '#ff9f80', run: '#fff1a8', ending: '#e8cf77' };
 const TYPE_COLOR = { intro: '#3b3550', verse: '#2b3a4f', pre: '#2f4656', chorus: '#55402c', inter: '#4d2e31', outro: '#3b3550' };
 const ROLE_SHORT = { rest: '休む', pad: 'そっと', arp: '分散和音', rhythm: '刻み', counter: '対旋律', answer: '掛け合い', double: 'メロディ', solo: 'ソロ', riff: 'リフ' };
 
@@ -468,12 +468,13 @@ function drawTimeline() {
     g.globalAlpha = 0.45 + 0.55 * n.vel;
     g.fillStyle = ROLE_COLOR[n.role] || '#ccc';
     roundRect(g, X(n.t), Y(n.midi) - nh / 2, Math.max(2, X(n.d) - 1), nh, 2);
+    if (n.dbl != null) { g.fill(); roundRect(g, X(n.t), Y(n.dbl) - nh / 2, Math.max(2, X(n.d) - 1), nh, 2); } // 重音の下の音
     g.fill();
   }
   g.globalAlpha = 1;
   // 凡例
   if (!$('legend').childElementCount) {
-    const items = [['pad', 'そっと伴奏（歌の裏）'], ['arp', '分散和音'], ['rhythm', '刻み'], ['counter', '対旋律'], ['solo', 'ソロ'], ['riff', 'リフのまね'], ['double', '楽器のメロディを弾く'], ['copy', '楽器のフレーズをまねる'], ['answer', '掛け合い'], ['fill', '合いの手'], ['ending', '最後の音']];
+    const items = [['pad', 'そっと伴奏（歌の裏）'], ['arp', '分散和音'], ['rhythm', '刻み'], ['counter', '対旋律'], ['solo', 'ソロ'], ['riff', 'リフのまね'], ['double', '楽器のメロディを弾く'], ['copy', '楽器のフレーズをまねる'], ['answer', '掛け合い'], ['fill', '合いの手'], ['run', 'サビへの駆け上がり'], ['ending', '最後の音']];
     $('legend').replaceChildren(...items.map(([k, t]) => {
       const s = document.createElement('span');
       const i = document.createElement('i');
@@ -585,6 +586,7 @@ function renderFound() {
   const leadSecs = inst.filter((s) => leadStrong(S.an, s));
   if (an.groove && an.groove.some((g) => g)) lines.push('<p><b>ドラム・ベース</b>：小節ごとに、キック・スネア・ハイハットの入る 16 分を聞き取りました → 刻みはそこに乗せ、ソロ・対旋律もそのリズムに寄せて、強い所に軽くアクセントをつけます</p>');
   lines.push(`<p><b>楽器のメロディ</b>：${leadSecs.length ? `${leadSecs.map((s) => `${TYPE_LABEL[s.type]}${s.n}`).join('、')} で、ギター・ピアノなどの目立つ旋律を聞き取りました → バイオリンが同じ旋律を弾きます（楽器が休む所は前後へつながる線でうめます）` : '歌のないところに、はっきりした楽器の旋律は見つかりませんでした（区間の役割で「メロディを弾く」も選べます）'}。歌の息つぎに楽器が入れるフレーズは、バイオリンでまねます</p>`);
+  lines.push('<p><b>アレンジの型</b>（YouTube の弦アレンジ・バイオリン講座 61 本で多くが言っていたこと）：1番の Aメロは低く控えめに入り、サビのたびに少しずつ高く、最後のサビが頂点／歌と同じ音・同じ音域でかぶせない／歌が細かく動く間はのばし、休む・のばす間に動く／長い音は和音が変わっても共通の音を保つ／サビの頭へ駆け上がり、Bメロの終わりは 8 分の刻みで押し上げる／サビが終わったら急に切らずにのばして消える／ソロは短い動機を高さを変えてくり返し、最後に戻る／最後のサビの山場と最後の音は重音</p>');
   if (S.an.vocalLine) lines.push('<p><b>掛け合い</b>：歌のフレーズが終わった息つぎで、その終わりの形をまねて答えます（サビは歌と同じメロディを重ねることもできます：区間の役割「メロディを弾く」）</p>');
   const keys = [];
   an.keyPerBar.forEach((k, i) => { if (!i || k.tonic !== an.keyPerBar[i - 1].tonic || k.mode !== an.keyPerBar[i - 1].mode) keys.push(`${keyNameTrad(k)}（${fmt(an.bars[i].t0)}〜）`); });
@@ -703,9 +705,11 @@ async function doExport(kind) {
       const an = S.anView;
       const q = quantizedNotes(currentScore()).map((n) => {
         const t = beatToTime(an.beats, n.beat), t2 = beatToTime(an.beats, n.beat + n.dur);
-        return { t, d: t2 - t, midi: n.midi, vel: n.vel };
+        return { t, d: t2 - t, midi: n.midi, vel: n.vel, art: n.art, dbl: n.dbl };
       });
-      download(notesToMidi(q, an, { title: S.fileName }), `${S.fileName}_バイオリン.mid`);
+      // 駆け上がり（5〜7 連符）は拍にそろえず、そのままのタイミングで
+      const runs = S.result.notes.filter((n) => n.role === 'run').map((n) => ({ t: n.t, d: n.d, midi: n.midi, vel: n.vel, art: n.art }));
+      download(notesToMidi(q.concat(runs).sort((a, b) => a.t - b.t), an, { title: S.fileName }), `${S.fileName}_バイオリン.mid`);
       note.textContent = 'MIDI を保存しました（Logic にドラッグすると、曲のテンポと小節線も合います）';
       return;
     }

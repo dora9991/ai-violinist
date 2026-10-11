@@ -3,4 +3,4 @@ Versilian Studios (Sam Gossner, Simon Dalzell; sample cutting by Elan Hickler/So
 https://versilian-studios.com/vsco-community/  /  https://github.com/sgossner/VSCO-2-CE
 License: CC0 1.0 Universal (public domain dedication)
 
-このフォルダの音は、上の録音を、音の高さの補正・音量合わせ・ループ（継ぎ目なくのばす部分）の作成・モノラル FLAC への変換をしたものです。
+このフォルダの音は、上の録音（Arco Vib・spiccato・Pizz・Trem）を、音の高さの補正・音量合わせ・ループ（継ぎ目なくのばす部分）の作成・モノラル FLAC への変換をしたものです。

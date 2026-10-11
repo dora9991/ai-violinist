@@ -64,6 +64,10 @@ function chooseRhythm(ctx, bars, opt) {
     const phraseEnd = pb && !last && bi % pb === pb - 1;
     // フレーズの最後の小節：最後の 1 拍に新しい音がなく、最後は休み（＝息つぎ）
     const breathes = (p) => !p.slice(12).includes('x') && p.slice(13) === '...';
+    // ソロの組み立て（ギター・バイオリンのアドリブ講座）：短い動機を、高さを変えてくり返す（問い → 答え → 問いのくり返し → 締め）。
+    // 4 小節ごとの 3 小節目は多くの場合 1 小節目と同じリズム、終わりの手前では最初の動機に戻る。長いフレーズの丸ごとのくり返しはしない
+    const src = opt.motif ? (bi % 4 === 2 ? out[bi - 2] : bars.length >= 6 && bi === bars.length - 2 ? out[0] : null) : null;
+    if (src && (!phraseEnd || breathes(src.p)) && !(last && opt.endRest) && rand() < (bi % 4 === 2 ? 0.75 : 0.6)) { out.push(src); prev = src; return; }
     for (let pass = 0; pass < 2 && !cand.length; pass++) for (const q of pool) {
       if (q.n < (pass ? 1 : dmin) || q.n > dmax) continue;
       if (phraseEnd && !breathes(q.p)) continue;
@@ -149,7 +153,23 @@ export function genLine(ctx, opt) {
   const chordOf = (x) => an.chords[clamp(Math.floor(x + 1e-6), 0, an.chords.length - 1)];
   const rootAt = (x) => { const c = chordOf(x); return c ? c.root : ctx.chordRoot(x); };
   const keyOf = (n) => `${rootAt(n.step / 4)}:${(chordOf(n.step / 4) || {}).q || ''}`;
-  let beam = [{ score: 0, seq: [], last: opt.prev ?? null, piv: null }];
+  // ソロの動機：同じリズムの小節（4 小節ごとの 3 小節目は 1 小節目、終わりの手前は最初の小節）の音の動きをなぞる
+  let srcOf = null, srcHome = null;
+  if (opt.motif) {
+    const groups = bars.map((b) => notes.map((n, i) => [n, i]).filter(([n]) => n.step >= b.b0 * 4 && n.step < b.b0 * 4 + 16));
+    srcOf = new Array(notes.length).fill(-1);
+    srcHome = new Array(notes.length).fill(false);
+    const link = (bi, sb, home) => {
+      const g = groups[bi], sg = groups[sb];
+      if (!g || !sg || !g.length || g.length !== sg.length || !g.every(([n], k) => n.pos === sg[k][0].pos)) return;
+      g.forEach(([, i], k) => { srcOf[i] = sg[k][1]; srcHome[i] = home; });
+    };
+    groups.forEach((g, bi) => { if (bi % 4 === 2) link(bi, bi - 2, false); });
+    if (bars.length >= 6) link(bars.length - 2, 0, true);
+  }
+  // 歌との 2 声の決まり（YouTube の弦アレンジ講座で多くが言っていたこと）に使う、各音の始まりの歌の高さ
+  const vocAt = opt.vocalPitch ? notes.map((n) => opt.vocalPitch(n.step)) : null;
+  let beam = [{ score: 0, seq: [], last: opt.prev ?? null, piv: null, par: 0 }];
   notes.forEach((n, i) => {
     const x = n.step / 4, len = n.len / 4;
     const mc = metric(n.pos);
@@ -188,6 +208,10 @@ export function genLine(ctx, opt) {
           s -= 0.06 * Math.abs(m - (b.last ?? center));
         }
         if (phraseEnd) s += LM.final[role] * 0.9;
+        // 合いの手：調のペンタトニック（メジャー 1・2・3・5・6 度＝マイナー 1・♭3・4・5・♭7 度）はコードをほぼ選ばずに合うので少し好む
+        if (opt.penta) { const k = ctx.keyAt(x); const pent = k.mode === 'minor' ? [0, 3, 5, 7, 10] : [0, 2, 4, 7, 9]; if (pent.includes(pcOf(m - k.tonic))) s += opt.penta; }
+        // 伴奏の線（対旋律）：強拍の長い音は根音を避ける（根音はベースの役目。3度・5度・7度・9度で彩る）
+        if (opt.avoidRoot && role === 0 && mc <= 1 && n.len >= 4) s -= opt.avoidRoot;
         s -= 0.025 * Math.abs(m - center);
         // 同じ音の連続は 2 回まで
         const L = b.seq.length;
@@ -201,16 +225,44 @@ export function genLine(ctx, opt) {
           if (span <= 2) s -= 1.5; else if (span <= 4) s -= 0.4;
         }
         // 歌との関係（音の始まり）
+        let par = 0;
         if (vocal != null) {
           if (m === vocal) s -= 2.5; // 同じ高さで重ならない
           else s += (LM.withMel[pcOf(m - vocal)] + 2.2) * (opt.vocalWeight ?? 0.6);
           if (Math.abs(m - vocal) <= 2) s -= 1.2; // 2度でこすれない
+          // 歌と同じ音名（オクターブちがい）を長く・強拍で重ねない（歌が埋もれる）
+          if (m !== vocal && pcOf(m - vocal) === 0 && (mc <= 1 || n.len >= 4)) s -= 1.2;
+          // 強拍で、歌と完全 4 度にならない（2 声では 3 度へ解決したがる響き）
+          const dv = Math.abs(m - vocal) % 12;
+          if (mc === 0 && dv === 5) s -= 0.8;
+          // 前の音からの動き：歌と同じ向きに動いて、完全 1・5・8 度が続かない（平行）／3度・6度の平行は 3 回まで
+          const pv = i > 0 && vocAt ? vocAt[i - 1] : null;
+          if (pv != null && b.last != null && connected) {
+            const dirV = Math.sign(vocal - pv), dirM = Math.sign(m - b.last);
+            const ivNow = Math.abs(m - vocal) % 12, ivPrev = Math.abs(b.last - pv) % 12;
+            if (dirV !== 0 && dirV === dirM) {
+              if ((ivNow === 0 || ivNow === 7) && ivNow === ivPrev) s -= 1.6;
+              const thirdSixth = (v) => v === 3 || v === 4 || v === 8 || v === 9;
+              if (thirdSixth(ivNow) && thirdSixth(ivPrev)) { par = b.par + 1; if (par >= 3) s -= 1.0; }
+            }
+          }
         }
         // 長い音は、のばしている間に歌と 2度でこすれる時間が短いほどよい
         if (opt.vocalPitch && n.len >= 3) {
           let rub = 0, cnt = 0;
           for (let k = 1; k < n.len; k++) { const v = opt.vocalPitch(n.step + k); if (v == null) continue; cnt++; const d = Math.abs(m - v) % 12; if (d === 1 || d === 2 || d === 10 || d === 11) rub++; }
           if (cnt) s -= 2.2 * (rub / cnt);
+        }
+        // ソロの動機をなぞる：同じ動き（音程）なら加点。くり返しの最初の音は、動機の最初の音から 2〜5 半音（終わりの手前は同じ高さ）
+        if (srcOf && srcOf[i] >= 0) {
+          const j = srcOf[i];
+          if (i > 0 && j > 0 && srcOf[i - 1] === j - 1) {
+            const ivSrc = b.seq[j] - b.seq[j - 1], ivNow = m - b.seq[i - 1];
+            if (ivNow === ivSrc) s += 1.0; else if (Math.sign(ivNow) === Math.sign(ivSrc)) s += 0.4;
+          } else {
+            const d = Math.abs(m - b.seq[j]);
+            if (srcHome[i] ? d === 0 : d >= 2 && d <= 5) s += 0.7;
+          }
         }
         // 次へのつながり（区間の最後の音・合いの手の最後の音）
         if (!nextN && opt.target != null) {
@@ -219,7 +271,7 @@ export function genLine(ctx, opt) {
         }
         // 毎回いちばん確からしい音だけを選ぶと単調になる（ぐるぐる回る）ので、少しゆらぎを入れて選ぶ
         const g = -Math.log(-Math.log(Math.max(1e-9, ctx.rand())));
-        next.push({ score: s, key: s + (opt.temp ?? 0.7) * g, seq: b.seq.concat(m), last: m, piv: b.last != null && connected ? m - b.last : null });
+        next.push({ score: s, key: s + (opt.temp ?? 0.7) * g, seq: b.seq.concat(m), last: m, piv: b.last != null && connected ? m - b.last : null, par });
       }
     }
     next.sort((a, b) => b.key - a.key);

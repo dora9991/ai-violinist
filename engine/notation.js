@@ -12,11 +12,13 @@ const posOf = (p) => p.octave * 7 + STEP_IDX[p.step] - (4 * 7 + 2); // E4 = 0
 const yOf = (pos) => STAFF_TOP + 4 * SP - (pos * SP) / 2;
 const r1 = (x) => Math.round(x * 10) / 10;
 
+const GRACE_W = 7.5; // 装飾音 1 つ分の幅
+const graceW = (e) => (e.graces ? e.graces.length * GRACE_W + 6 : 0);
 function evWidth(e) {
   let w = Math.max(17, 9 + 25 * Math.pow(e.dur / 4, 0.62));
   if (e.accidental) w += 8;
   if (e.dots) w += 5;
-  return w;
+  return w + graceW(e);
 }
 function keySigWidth(f) { return Math.abs(f) * 9 + (f ? 6 : 0); }
 
@@ -120,7 +122,7 @@ export function renderScore(score, opt = {}) {
         let ex = ix + 10;
         for (const e of evs) {
           const w = evWidth(e) * scale;
-          xs.push(ex + (e.accidental ? 8 : 0));
+          xs.push(ex + graceW(e) + (e.accidental ? 8 : 0));
           ex += w;
         }
         // コードネーム：小節の一番高い音より上に
@@ -232,11 +234,21 @@ function drawEvents(g, evs, xs, m, onTie) {
     if (e.rest) { drawRest(g, x, e, m); return; }
     const pos = posOf(e.pitch);
     const y = yOf(pos);
+    if (e.graces) drawGraces(g, e, x - graceW(e) - (e.accidental ? 8 : 0) + 2);
     // 加線
     for (let p = -2; p >= pos; p -= 2) g.push(`<line x1="${r1(x - 9)}" y1="${r1(yOf(p))}" x2="${r1(x + 9)}" y2="${r1(yOf(p))}" class="ledger"/>`);
     for (let p = 10; p <= pos; p += 2) g.push(`<line x1="${r1(x - 9)}" y1="${r1(yOf(p))}" x2="${r1(x + 9)}" y2="${r1(yOf(p))}" class="ledger"/>`);
     // 臨時記号
     if (e.accidental) g.push(`<text x="${r1(x - 17)}" y="${r1(y + (e.accidental === 'flat' ? 4 : 5))}" class="acc">${e.accidental === 'sharp' ? '♯' : e.accidental === 'flat' ? '♭' : '♮'}</text>`);
+    // 重音の下の音（同じ符幹にもう 1 つのたま）
+    if (e.dbl) {
+      const dp = posOf(e.dbl), dy = yOf(dp);
+      for (let p = -2; p >= dp; p -= 2) g.push(`<line x1="${r1(x - 9)}" y1="${r1(yOf(p))}" x2="${r1(x + 9)}" y2="${r1(yOf(p))}" class="ledger"/>`);
+      if (e.dblAccidental) g.push(`<text x="${r1(x - 17)}" y="${r1(dy + (e.dblAccidental === 'flat' ? 4 : 5))}" class="acc">${e.dblAccidental === 'sharp' ? '♯' : e.dblAccidental === 'flat' ? '♭' : '♮'}</text>`);
+      const hollowD = e.type === 'half' || e.type === 'whole';
+      g.push(`<ellipse cx="${r1(x)}" cy="${r1(dy)}" rx="5.4" ry="3.9" transform="rotate(-20 ${r1(x)} ${r1(dy)})" class="${hollowD ? 'hollow' : 'ink'}"/>`);
+      if (e.type !== 'whole') { const upD = pos < 4; const sxD = x + (upD ? 5 : -5); g.push(`<line x1="${r1(sxD)}" y1="${r1(dy)}" x2="${r1(sxD)}" y2="${r1(y)}" class="stem"/>`); }
+    }
     // たま
     const hollow = e.type === 'half' || e.type === 'whole';
     g.push(`<ellipse cx="${r1(x)}" cy="${r1(y)}" rx="5.4" ry="3.9" transform="rotate(-20 ${r1(x)} ${r1(y)})" class="${hollow ? 'hollow' : 'ink'}"/>`);
@@ -262,8 +274,32 @@ function drawEvents(g, evs, xs, m, onTie) {
     if (e.trill) g.push(`<text x="${r1(x - 4)}" y="${r1(Math.min(STAFF_TOP - 4, y - 16))}" class="orn">tr</text>`);
     if (e.accent) g.push(`<text x="${r1(x - 4)}" y="${r1(up ? Math.max(yOf(0) + 14, y + 16) : Math.min(STAFF_TOP - 4, y - 12))}" class="accent">&gt;</text>`);
     if (e.slide) g.push(`<line x1="${r1(x - 16)}" y1="${r1(y + 7)}" x2="${r1(x - 8)}" y2="${r1(y + 1)}" class="stem"/>`);
+    if (e.tech) g.push(`<text x="${r1(x - 6)}" y="${r1(Math.min(STAFF_TOP - (e.trill ? 18 : 4), y - (e.trill ? 30 : 16)))}" class="tech">${e.tech}</text>`);
+    if (e.trem) {
+      // トレモロ：符幹（全音符はたまの上）に斜めの 3 本線
+      const sx = e.type === 'whole' ? x : x + (up ? 5 : -5);
+      const my = e.type === 'whole' ? y - 2.6 * SP : y + (up ? -2.2 * SP : 1.6 * SP);
+      for (let k = 0; k < 3; k++) g.push(`<line x1="${r1(sx - 4.5)}" y1="${r1(my + k * 3.6 + 1.6)}" x2="${r1(sx + 4.5)}" y2="${r1(my + k * 3.6 - 1.6)}" class="trem"/>`);
+    }
     onTie({ x, y, up, start: !!e.tieStart, stop: !!e.tieStop }); // 符幹が上ならタイは下
   });
+}
+
+// 駆け上がりの小さな音符（符幹は上・連桁 2 本）
+function drawGraces(g, e, xStart) {
+  const heads = e.graces.map((gp, k) => ({ x: xStart + k * GRACE_W + 3, pos: posOf(gp) }));
+  const top = Math.min(...heads.map((h) => yOf(h.pos))) - 22;
+  heads.forEach((h, k) => {
+    const y = yOf(h.pos);
+    for (let p = -2; p >= h.pos; p -= 2) g.push(`<line x1="${r1(h.x - 5)}" y1="${r1(yOf(p))}" x2="${r1(h.x + 5)}" y2="${r1(yOf(p))}" class="ledger"/>`);
+    for (let p = 10; p <= h.pos; p += 2) g.push(`<line x1="${r1(h.x - 5)}" y1="${r1(yOf(p))}" x2="${r1(h.x + 5)}" y2="${r1(yOf(p))}" class="ledger"/>`);
+    const gp = e.graces[k];
+    if (gp.alter) g.push(`<text x="${r1(h.x - 8.5)}" y="${r1(y + 3)}" class="gacc">${gp.alter === 1 ? '♯' : '♭'}</text>`);
+    g.push(`<ellipse cx="${r1(h.x)}" cy="${r1(y)}" rx="3.3" ry="2.4" transform="rotate(-20 ${r1(h.x)} ${r1(y)})" class="ink"/>`);
+    g.push(`<line x1="${r1(h.x + 3)}" y1="${r1(y - 1)}" x2="${r1(h.x + 3)}" y2="${r1(top)}" class="gstem"/>`);
+  });
+  const xa = heads[0].x + 3, xb = heads[heads.length - 1].x + 3;
+  for (const dy of [0, 4]) g.push(`<line x1="${r1(xa)}" y1="${r1(top + dy)}" x2="${r1(xb)}" y2="${r1(top + dy)}" class="gbeam"/>`);
 }
 
 function drawRest(g, x, e, m) {
@@ -316,6 +352,11 @@ svg.system .secbox{fill:#f3ece2;stroke:#c9b49a;stroke-width:1}
 svg.system .dyn{font:italic 700 15px "Times New Roman",serif;fill:#111}
 svg.system .orn{font:italic 700 13px "Times New Roman",serif;fill:#111}
 svg.system .accent{font:700 13px sans-serif;fill:#111}
+svg.system .tech{font:italic 11px serif;fill:#111}
+svg.system .gstem{stroke:#111;stroke-width:0.9}
+svg.system .gbeam{stroke:#111;stroke-width:2.2}
+svg.system .gacc{font:9px ${MUSIC_FONT};fill:#111}
+svg.system .trem{stroke:#111;stroke-width:2.2}
 `;
 
 // ト音記号は文字（フォント）で描くので、大きさがフォントによって違う。描いたあとで測って、五線にちょうど合う大きさにそろえる

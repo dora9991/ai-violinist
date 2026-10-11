@@ -89,11 +89,16 @@ export function notesToMidi(notes, an, opt = {}) {
   ev(last, [0xff, 0x2f, 0x00]);
   // 音符
   const list = [];
+  let techNow = 'arco';
   for (const n of notes) {
     const a = tick(n.t), b = Math.max(a + 1, tick(n.t + n.d));
+    // 弓で弾く／はじく／トレモロの切りかえは、文字のイベントで残す（DAW の画面に出る）
+    const tech = n.art === 'pizz' ? 'pizz.' : n.art === 'trem' ? 'trem.' : 'arco';
+    if (tech !== techNow) { list.push({ tk: a, order: 0.5, bytes: textEvent(0x01, tech) }); techNow = tech; }
     const vel = Math.max(1, Math.min(127, Math.round(25 + 100 * n.vel)));
     list.push({ tk: a, order: 1, bytes: [0x90, n.midi, vel] });
     list.push({ tk: b, order: 0, bytes: [0x80, n.midi, 0] });
+    if (n.dbl != null) { list.push({ tk: a, order: 1, bytes: [0x90, n.dbl, Math.max(1, vel - 8)] }); list.push({ tk: b, order: 0, bytes: [0x80, n.dbl, 0] }); }
   }
   list.sort((x, y) => x.tk - y.tk || x.order - y.order);
   const t1 = [];

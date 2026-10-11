@@ -113,6 +113,22 @@ const KIND = { maj: 'major', min: 'minor', dom7: 'dominant', maj7: 'major-sevent
 export function buildScore(an, notes, plan, opt = {}) {
   const meter = an.meter || 4;
   const toBeat = beatMapper(an.beats);
+  // 駆け上がり（5〜7 連符）は 16 分の格子にのらないので、着地の音の前の小さな音符（装飾音）として書く
+  const graceOf = new Map();
+  if (notes.some((n) => n.role === 'run')) {
+    const runs = notes.filter((n) => n.role === 'run').sort((a, b) => a.t - b.t);
+    notes = notes.filter((n) => n.role !== 'run');
+    let grp = [];
+    const flushRun = () => {
+      if (!grp.length) return;
+      const end = grp[grp.length - 1].t + grp[grp.length - 1].d;
+      const land = notes.find((n) => n.t >= end - 0.12 && n.t <= end + 0.12);
+      if (land) graceOf.set(land, grp.map((n) => n.midi));
+      grp = [];
+    };
+    for (const n of runs) { if (grp.length && n.t - (grp[grp.length - 1].t + grp[grp.length - 1].d) > 0.1) flushRun(); grp.push(n); }
+    flushRun();
+  }
   // 1. 16分の格子にそろえる
   let ev = notes.map((n) => {
     const s = Math.round(toBeat(n.t) * Q);
@@ -136,6 +152,7 @@ export function buildScore(an, notes, plan, opt = {}) {
   let prevFifths = null, prevDyn = null;
   const secStart = new Map();
   an.sections.forEach((s, i) => secStart.set(s.bar0, i));
+  let techNow = 'arco'; // 弓で弾く（arco）／はじく（pizz.）の切りかえを書くため
   // 調の決め方：小節の調（解析）をそのまま
   bars.forEach((bar, bi) => {
     const barLen = bar.n * Q;
@@ -176,9 +193,10 @@ export function buildScore(an, notes, plan, opt = {}) {
       if (s > p) for (const r of splitDur(p - B0, s - p, barLen, meter, true)) m.events.push({ rest: true, pos: r.p, dur: r.dur });
       const parts = splitDur(s - B0, e - s, barLen, meter, false);
       const pitch = spell(x.n.midi, fifths);
+      const dbl = x.n.dbl != null ? spell(x.n.dbl, fifths) : null; // 重音の下の音
       parts.forEach((pt, k) => {
         m.events.push({
-          rest: false, pos: pt.p, dur: pt.dur, pitch,
+          rest: false, pos: pt.p, dur: pt.dur, pitch, dbl,
           tieStop: k > 0 || x.s < B0, tieStart: k < parts.length - 1 || x.e > B1,
           first: k === 0 && x.s >= B0, n: x.n,
         });
@@ -191,11 +209,14 @@ export function buildScore(an, notes, plan, opt = {}) {
     const state = {};
     for (const e of m.events) {
       if (e.rest) continue;
-      const k = e.pitch.step + e.pitch.octave;
-      const cur = k in state ? state[k] : ka[e.pitch.step];
-      if (e.tieStop && !e.first) { state[k] = e.pitch.alter; continue; }
-      if (e.pitch.alter !== cur) e.accidental = e.pitch.alter === 1 ? 'sharp' : e.pitch.alter === -1 ? 'flat' : 'natural';
-      state[k] = e.pitch.alter;
+      for (const [p, key] of [[e.pitch, 'accidental'], [e.dbl, 'dblAccidental']]) {
+        if (!p) continue;
+        const k = p.step + p.octave;
+        const cur = k in state ? state[k] : ka[p.step];
+        if (e.tieStop && !e.first) { state[k] = p.alter; continue; }
+        if (p.alter !== cur) e[key] = p.alter === 1 ? 'sharp' : p.alter === -1 ? 'flat' : 'natural';
+        state[k] = p.alter;
+      }
     }
     // 連桁（8分・16分を拍ごとにまとめる）
     let group = [];
@@ -218,8 +239,13 @@ export function buildScore(an, notes, plan, opt = {}) {
       if (e.n.trill) e.trill = true;
       if (e.n.slide || e.n.bend) e.slide = true;
       if (e.n.grace) e.grace = spell(e.n.midi + e.n.grace, fifths);
+      const gr = graceOf.get(e.n);
+      if (gr) e.graces = gr.map((mm) => spell(mm, fifths));
       if (e.n.art === 'mrc' && e.dur <= 2) e.accent = true;
+      const tech = e.n.art === 'pizz' ? 'pizz' : 'arco';
+      if (tech !== techNow) { e.tech = tech === 'pizz' ? 'pizz.' : 'arco'; techNow = tech; }
     }
+    for (const e of m.events) if (!e.rest && e.n.art === 'trem') e.trem = true; // トレモロ（符幹に 3 本線）
     for (const e of m.events) e.type = TYPE_OF[e.dur][0], e.dots = TYPE_OF[e.dur][1];
     measures.push(m);
   });
@@ -263,6 +289,15 @@ export function scoreToMusicXML(score) {
         out.push(`<harmony print-frame="no"><root><root-step>${c.root.step}</root-step>${c.root.alter ? `<root-alter>${c.root.alter}</root-alter>` : ''}</root><kind text="${esc(c.name.replace(/^[A-G][#b]?/, ''))}">${c.kind}</kind>${off ? `<offset>${off}</offset>` : ''}</harmony>`);
         ci++;
       }
+      if (e.tech) out.push(`<direction placement="above"><direction-type><words>${e.tech}</words></direction-type></direction>`);
+      if (e.graces) {
+        const ka = keyAlters(m.fifths);
+        e.graces.forEach((gp, k) => {
+          const acc = (gp.alter || 0) !== (ka[gp.step] || 0) ? `<accidental>${gp.alter === 1 ? 'sharp' : gp.alter === -1 ? 'flat' : 'natural'}</accidental>` : '';
+          const bm = k === 0 ? 'begin' : k === e.graces.length - 1 ? 'end' : 'continue';
+          out.push(`<note><grace/><pitch><step>${gp.step}</step>${gp.alter ? `<alter>${gp.alter}</alter>` : ''}<octave>${gp.octave}</octave></pitch><voice>1</voice><type>32nd</type>${acc}<stem>up</stem><beam number="1">${bm}</beam><beam number="2">${bm}</beam><beam number="3">${bm}</beam></note>`);
+        });
+      }
       if (e.grace) out.push(`<note><grace slash="yes"/><pitch><step>${e.grace.step}</step>${e.grace.alter ? `<alter>${e.grace.alter}</alter>` : ''}<octave>${e.grace.octave}</octave></pitch><voice>1</voice><type>16th</type><stem>up</stem></note>`);
       const parts = ['<note>'];
       if (e.rest) parts.push(e.dur === m.barLen ? '<rest measure="yes"/>' : '<rest/>');
@@ -280,12 +315,28 @@ export function scoreToMusicXML(score) {
       if (!e.rest && e.tieStart) nots.push('<tied type="start"/>');
       const orn = [];
       if (e.trill) orn.push('<trill-mark/>');
+      if (e.trem) orn.push('<tremolo type="single">3</tremolo>');
       if (orn.length) nots.push(`<ornaments>${orn.join('')}</ornaments>`);
       if (e.accent) nots.push('<articulations><accent/></articulations>');
       if (e.slide) nots.push('<articulations><scoop/></articulations>');
       if (nots.length) parts.push(`<notations>${nots.join('')}</notations>`);
       parts.push('</note>');
       out.push(parts.join(''));
+      if (!e.rest && e.dbl) {
+        // 重音の下の音（同じ符幹の和音）
+        const ds = ['<note><chord/>', `<pitch><step>${e.dbl.step}</step>${e.dbl.alter ? `<alter>${e.dbl.alter}</alter>` : ''}<octave>${e.dbl.octave}</octave></pitch>`, `<duration>${e.dur}</duration>`];
+        if (e.tieStop) ds.push('<tie type="stop"/>');
+        if (e.tieStart) ds.push('<tie type="start"/>');
+        ds.push('<voice>1</voice>', `<type>${e.type}</type>`);
+        for (let d = 0; d < e.dots; d++) ds.push('<dot/>');
+        if (e.dblAccidental) ds.push(`<accidental>${e.dblAccidental}</accidental>`);
+        const dn = [];
+        if (e.tieStop) dn.push('<tied type="stop"/>');
+        if (e.tieStart) dn.push('<tied type="start"/>');
+        if (dn.length) ds.push(`<notations>${dn.join('')}</notations>`);
+        ds.push('</note>');
+        out.push(ds.join(''));
+      }
       pos = e.pos + e.dur;
     }
     if (mi === score.measures.length - 1) out.push('<barline location="right"><bar-style>light-heavy</bar-style></barline>');
@@ -308,7 +359,7 @@ export function quantizedNotes(score) {
         if (!e.tieStart) open = null;
         continue;
       }
-      const it = { beat: m.b0 + e.pos / Q, dur: e.dur / Q, midi: e.pitch.midi, vel: e.n.vel };
+      const it = { beat: m.b0 + e.pos / Q, dur: e.dur / Q, midi: e.pitch.midi, vel: e.n.vel, art: e.n.art, dbl: e.n.dbl };
       list.push(it);
       open = e.tieStart ? it : null;
     }
