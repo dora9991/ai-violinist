@@ -103,11 +103,19 @@
         <button data-mode="violin">バイオリンだけ</button>
       </div>
       <label class="slider">バイオリン<input type="range" id="vol-violin" min="0" max="2" step="0.01" value="1"></label>
-      <label class="slider">原曲<input type="range" id="vol-song" min="0" max="1.5" step="0.01" value="1"></label>
+      <label class="slider" id="vol-guitar-wrap" hidden>ギター<input type="range" id="vol-guitar" min="0" max="2" step="0.01" value="1"></label>
+      <label class="slider"><span id="vol-song-label">原曲</span><input type="range" id="vol-song" min="0" max="1.5" step="0.01" value="1"></label>
       <label class="slider">響き<input type="range" id="reverb" min="0" max="0.8" step="0.01" value="0.28"></label>
     </div>
 
     <div class="panel arrange">
+      <div class="ctrl wide">
+        <span class="ctrl-label">作り方</span>
+        <div class="seg" id="arr-mode">
+          <button data-v="add" class="on">原曲にバイオリンを足す</button>
+          <button data-v="trio">歌＋アコギ＋バイオリンで作り直す</button>
+        </div>
+      </div>
       <div class="ctrl">
         <span class="ctrl-label">弾き方</span>
         <div class="seg" id="style">
@@ -152,13 +160,41 @@
       <span class="idea" id="idea"></span>
     </div>
 
+    <div class="panel trio" id="trio-panel" hidden>
+      <div class="trio-row">
+        <b class="trio-title">歌</b>
+        <span class="trio-state" id="trio-vocal-state">まだ取り出していません（今はギターとバイオリンだけが鳴ります）</span>
+        <button class="btn primary" id="trio-sep">AI で原曲から歌を取り出す</button>
+        <label class="btn" for="trio-vocal-file">歌だけのファイルを入れる</label>
+        <input type="file" id="trio-vocal-file" accept="audio/*,.m4a,.mp3,.wav,.aif,.aiff" hidden>
+        <progress id="trio-prog" max="1" value="0" hidden></progress>
+      </div>
+      <p class="trio-help">Logic の「ステム分割」などで書き出した、歌だけのトラックを入れると、いちばんきれいです（曲の頭がずれていても自動で合わせます）。AI で取り出すときは、曲はこのパソコンの中だけで処理します。</p>
+      <div class="ctrl">
+        <span class="ctrl-label">ギターの弾き方</span>
+        <div class="seg" id="guitar-style">
+          <button data-v="auto" class="on">おまかせ</button>
+          <button data-v="arp">アルペジオ中心</button>
+          <button data-v="strum">ストローク中心</button>
+        </div>
+      </div>
+      <div class="trio-chords" id="trio-chords"></div>
+    </div>
+
     <h3 class="h3">区間ごとの弾き方 <small>AI のおまかせを変えられます。歌の判定がちがうときは「歌あり／歌なし」を押して直せます。</small></h3>
     <div class="sections" id="sections"></div>
+
+    <details class="panel patbook" id="patbook">
+      <summary>パターン帳 <small>1・5・8／スケール／リック。区間のカードの「型」で選ぶと、その区間はその型で弾きます（音はその場のコードと調に合わせます）</small></summary>
+      <div id="patbook-body"></div>
+    </details>
 
     <div class="panel exports">
       <span class="ctrl-label">保存</span>
       <button class="btn primary" data-export="mix">ミックスを保存（WAV）</button>
       <button class="btn" data-export="violin">バイオリンだけ（WAV）</button>
+      <button class="btn trio-only" data-export="guitar" hidden>ギターだけ（WAV）</button>
+      <button class="btn trio-only" data-export="vocal" hidden>歌だけ（WAV）</button>
       <button class="btn" data-export="midi">MIDI（Logic 用・テンポ入り）</button>
       <button class="btn" data-export="score">楽譜を見る・印刷（PDF）</button>
       <button class="btn" data-export="musicxml">楽譜ファイル（MusicXML）</button>
@@ -173,6 +209,7 @@
   <footer class="credits">
     使っている素材：バイオリンの音＝<a href="https://versilian-studios.com/vsco-community/" target="_blank" rel="noopener">VSCO 2 Community Edition</a>（Versilian Studios・CC0）／
     旋律のつながり＝<a href="https://github.com/music-x-lab/POP909-Dataset" target="_blank" rel="noopener">POP909</a>（Wang ほか, ISMIR 2020・MIT）と <a href="https://guitarset.weebly.com/" target="_blank" rel="noopener">GuitarSet</a>（Xi, Bittner, Pauwels, Ye, Bello, ISMIR 2018・<a href="https://creativecommons.org/licenses/by/4.0/deed.ja" target="_blank" rel="noopener">CC BY 4.0</a>）から学んだ統計／
+    アコギの音＝<a href="https://packages.debian.org/sid/fluid-soundfont-gm" target="_blank" rel="noopener">Fluid R3 GM</a>（Frank Wen・MIT）と <a href="https://github.com/sfzinstruments/karoryfer.shinyguitar" target="_blank" rel="noopener">Shinyguitar</a> のミュート音（Karoryfer Samples・CC0）／
     歌の判定＝Google の <a href="https://github.com/tensorflow/models/tree/master/research/audioset/yamnet" target="_blank" rel="noopener">YAMNet</a>（Apache 2.0）＋<a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">ONNX Runtime Web</a>（MIT）
   </footer>
 </main>

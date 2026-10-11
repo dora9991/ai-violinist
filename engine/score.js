@@ -166,7 +166,7 @@ export function buildScore(an, notes, plan, opt = {}) {
       const si = secStart.get(bi);
       const s = an.sections[si];
       const p = plan && plan[si];
-      m.section = { name: `${TYPE_LABEL[s.type]}${s.n}`, role: p ? ROLE_LABEL[p.role] : '', rest: p && p.role === 'rest' };
+      m.section = { name: `${TYPE_LABEL[s.type]}${s.n}`, role: p ? (p.patternName ? `型：${p.patternName}` : ROLE_LABEL[p.role]) : '', rest: p && p.role === 'rest' && !p.patternName };
       const secNotes = notes.filter((n) => n.sec === si);
       if (secNotes.length) {
         const avg = secNotes.reduce((a, n) => a + n.vel, 0) / secNotes.length;

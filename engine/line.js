@@ -209,7 +209,7 @@ export function genLine(ctx, opt) {
         }
         if (phraseEnd) s += LM.final[role] * 0.9;
         // 合いの手：調のペンタトニック（メジャー 1・2・3・5・6 度＝マイナー 1・♭3・4・5・♭7 度）はコードをほぼ選ばずに合うので少し好む
-        if (opt.penta) { const k = ctx.keyAt(x); const pent = k.mode === 'minor' ? [0, 3, 5, 7, 10] : [0, 2, 4, 7, 9]; if (pent.includes(pcOf(m - k.tonic))) s += opt.penta; }
+        if (opt.penta) { const k = ctx.keyAt(x); const pent = k.mode === 'min' ? [0, 3, 5, 7, 10] : [0, 2, 4, 7, 9]; if (pent.includes(pcOf(m - k.tonic))) s += opt.penta; }
         // 伴奏の線（対旋律）：強拍の長い音は根音を避ける（根音はベースの役目。3度・5度・7度・9度で彩る）
         if (opt.avoidRoot && role === 0 && mc <= 1 && n.len >= 4) s -= opt.avoidRoot;
         s -= 0.025 * Math.abs(m - center);

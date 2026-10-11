@@ -1,7 +1,11 @@
 // AIバイオリニスト：画面の動き
-import { compose, setPhrases, phraseInfo, setLineModel, lineModelInfo, leadStrong, ROLE_LABEL, TYPE_LABEL, STYLES, LOW, HIGH } from './engine/compose.js';
+import { compose, planRoles, setPhrases, phraseInfo, setLineModel, lineModelInfo, leadStrong, patternPreview, ROLE_LABEL, TYPE_LABEL, STYLES, LOW, HIGH } from './engine/compose.js';
+import { arrangeGuitar, trioChroma } from './engine/guitar.js';
+import { loadGuitar, scheduleGuitar } from './engine/guitar-sampler.js';
+import { PATTERNS, CATEGORIES, RHYTHMS, ARTS, DOUBLES, parseCustom, findPattern } from './engine/patterns.js';
 import { chordName, keyNameJa, keyNameTrad, halfShift, pcName } from './engine/analyze.js';
-import { loadViolin, makeViolinBus, scheduleViolin, renderMix, loudnessOf } from './engine/sampler.js';
+
+import { loadViolin, makeViolinBus, scheduleViolin, renderMix, loudnessOf, makeImpulse } from './engine/sampler.js';
 import { audioBufferToWav, notesToMidi, download } from './engine/files.js';
 import { buildScore, scoreToMusicXML, quantizedNotes, beatToTime } from './engine/score.js';
 import { renderScore, SCORE_CSS, fitClefs } from './engine/notation.js';
@@ -12,7 +16,7 @@ const MUTED = new URLSearchParams(location.search).has('mute');
 const FORCE_STATIC = document.querySelector('meta[name="vai-mode"]')?.content === 'static' || new URLSearchParams(location.search).has('static');
 // 歌の判定の「歌っている」とみなす境目（AI ごとに出す数字の大きさが違う）
 const VOCAL_TH = { mac: 0.15, yamnet: 0.008 }; // YAMNet は tests/calibrate-yamnet.cjs で Mac の判定と 93% 一致する値
-const ROLE_COLOR = { pad: '#7aa7d9', arp: '#9fd3f7', rhythm: '#a6d96a', counter: '#6cc5b0', solo: '#f0a64a', riff: '#e2685b', fill: '#b993e6', answer: '#d98ad6', copy: '#f2829f', double: '#ff9f80', run: '#fff1a8', ending: '#e8cf77' };
+const ROLE_COLOR = { pad: '#7aa7d9', arp: '#9fd3f7', rhythm: '#a6d96a', counter: '#6cc5b0', solo: '#f0a64a', riff: '#e2685b', fill: '#b993e6', answer: '#d98ad6', copy: '#f2829f', double: '#ff9f80', run: '#fff1a8', pattern: '#7fe0d0', ending: '#e8cf77' };
 const TYPE_COLOR = { intro: '#3b3550', verse: '#2b3a4f', pre: '#2f4656', chorus: '#55402c', inter: '#4d2e31', outro: '#3b3550' };
 const ROLE_SHORT = { rest: '休む', pad: 'そっと', arp: '分散和音', rhythm: '刻み', counter: '対旋律', answer: '掛け合い', double: 'メロディ', solo: 'ソロ', riff: 'リフ' };
 
@@ -21,10 +25,14 @@ const S = {
   violin: null, violinP: null, violins: {}, mode: FORCE_STATIC ? 'static' : 'server', soundSet: 'free', listenSource: null,
   fileName: '', songBuf: null, pcm: null, listen: null,
   an: null, anView: null, anOpts: { beats: null, downbeatShift: 0, meter: null, key: null },
-  settings: { style: 'emotional', presence: 0.6, soloMotion: 1, motion: 1, seed: 1, roles: {}, vocal: {} },
+  settings: { style: 'emotional', presence: 0.6, soloMotion: 1, motion: 1, seed: 1, roles: {}, vocal: {}, patterns: {}, customPatterns: loadCustomPatterns() },
   result: null,
   player: { playing: false, startAt: 0, offset: 0, src: null, sched: null },
-  mix: { mode: 'both', vViolin: 1, vSong: 1, reverb: 0.28 },
+  mix: { mode: 'both', vViolin: 1, vSong: 1, vGuitar: 1, reverb: 0.28 },
+  // 作り方：add＝原曲にバイオリンを足す／trio＝歌＋アコギ＋バイオリンで作り直す
+  arrMode: 'add',
+  trio: { vocalBuf: null, vocalSource: null, guitar: null, style: 'auto', roles: {}, levels: { violin: 1, guitar: 1 } },
+  guitar: null, guitarP: null,
   violinLevel: 1,
   view: { pps: 0, W: 0, peaks: null, peaksW: 0 },
   busy: false,
@@ -112,7 +120,33 @@ function ensureAudio() {
   S.songGain = S.ctx.createGain();
   S.songGain.connect(limiter);
   S.bus = makeViolinBus(S.ctx, limiter, { reverb: S.mix.reverb, volume: S.mix.vViolin });
+  S.guitarBus = makeGuitarBus(S.ctx, limiter);
+  S.silentGain = S.ctx.createGain();
+  S.silentGain.gain.value = 0;
+  S.silentGain.connect(limiter);
   applyMix();
+}
+// アコギの音の通り道：低いこもりを少し切り、空気感を足して、軽い響き
+function makeGuitarBus(ctx, dest) {
+  const input = ctx.createGain();
+  const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 70; hp.Q.value = 0.7;
+  const body = ctx.createBiquadFilter(); body.type = 'peaking'; body.frequency.value = 230; body.Q.value = 1; body.gain.value = -2;
+  const air = ctx.createBiquadFilter(); air.type = 'highshelf'; air.frequency.value = 6000; air.gain.value = 2;
+  const out = ctx.createGain();
+  const wet = ctx.createGain(); wet.gain.value = 0.14;
+  const conv = ctx.createConvolver(); conv.buffer = makeImpulse(ctx, 1.6, 11);
+  input.connect(hp).connect(body).connect(air);
+  air.connect(out);
+  air.connect(conv).connect(wet).connect(out);
+  out.connect(dest);
+  return { input, out, setVolume(v, t = ctx.currentTime) { out.gain.setTargetAtTime(v, t, 0.03); } };
+}
+function ensureGuitar() {
+  if (!S.guitarP) {
+    S.guitarP = loadGuitar(S.ctx, 'samples-guitar/').then((g) => (S.guitar = g));
+    S.guitarP.catch(() => { S.guitarP = null; });
+  }
+  return S.guitarP;
 }
 function ensureViolin() {
   // フリー音源（VSCO・どこでも使える）か、この Mac の Logic の音か
@@ -160,7 +194,12 @@ async function handleFile(file) {
   S.fileName = file.name.replace(/\.[^.]+$/, '');
   S.settings.roles = {};
   S.settings.vocal = {};
+  S.settings.patterns = {};
   S.settings.seed = 1;
+  S.trio.vocalBuf = null;
+  S.trio.vocalSource = null;
+  S.trio.roles = {};
+  updateTrioUi();
   S.anOpts = { beats: null, downbeatShift: 0, meter: null, key: null };
   showBusy(`「${S.fileName}」を聞いています`);
   try {
@@ -299,7 +338,17 @@ function withVocalOverrides(an, vocal) {
 }
 function recompose() {
   S.anView = withVocalOverrides(S.an, S.settings.vocal);
-  S.result = compose(S.anView, { ...S.settings });
+  if (S.arrMode === 'trio') {
+    const plan = planRoles(S.anView, S.settings);
+    plan.forEach((p) => { const r = S.trio.roles[p.si]; if (r && r !== 'auto') p.guitar = r; });
+    S.trio.guitar = arrangeGuitar(S.anView, plan, { seed: S.settings.seed, guitarStyle: S.trio.style });
+    // バイオリンは、原曲の代わりに「ギターの押さえた音＋歌」が鳴っているものとして作る。伴奏が薄いので少し前に出す
+    S.result = compose({ ...S.anView, chroma: trioChroma(S.anView, S.trio.guitar) }, { ...S.settings, presence: Math.min(0.95, S.settings.presence + 0.1) });
+    renderTrioChords();
+  } else {
+    S.trio.guitar = null;
+    S.result = compose(S.anView, { ...S.settings });
+  }
   drawTimeline();
   renderSections();
   renderFound();
@@ -316,12 +365,13 @@ function showStudio() {
   $('songname').textContent = S.fileName;
   syncControls();
   requestAnimationFrame(() => { fitZoom(); drawTimeline(); updateTime(); });
+  renderPatternBook();
 }
 function renderFacts() {
   const an = S.an;
   const keys = [];
   an.keyPerBar.forEach((k, i) => { if (!i || k.tonic !== an.keyPerBar[i - 1].tonic || k.mode !== an.keyPerBar[i - 1].mode) keys.push(`${keyNameJa(k)}（${keyNameTrad(k)}）`); });
-  $('facts').innerHTML = `${fmt(an.duration)}・<b>${an.bpm.toFixed(an.steadyTempo ? 0 : 1)}</b> BPM${an.steadyTempo ? '' : '（揺れあり）'}・<b>${keys.slice(0, 3).join(' → ')}</b>${keys.length > 3 ? ' …' : ''}・${an.meter}拍子`;
+  $('facts').innerHTML = `${fmt(an.duration)}・<b>${an.bpm.toFixed(an.steadyTempo ? 0 : 1)}</b> BPM${an.steadyTempo ? '' : an.tempoFollow ? '（揺れあり・小節ごとに合わせる）' : '（揺れあり）'}・<b>${keys.slice(0, 3).join(' → ')}</b>${keys.length > 3 ? ' …' : ''}・${an.meter}拍子`;
 }
 function syncControls() {
   for (const b of $('style').children) b.classList.toggle('on', b.dataset.style === S.settings.style);
@@ -474,7 +524,7 @@ function drawTimeline() {
   g.globalAlpha = 1;
   // 凡例
   if (!$('legend').childElementCount) {
-    const items = [['pad', 'そっと伴奏（歌の裏）'], ['arp', '分散和音'], ['rhythm', '刻み'], ['counter', '対旋律'], ['solo', 'ソロ'], ['riff', 'リフのまね'], ['double', '楽器のメロディを弾く'], ['copy', '楽器のフレーズをまねる'], ['answer', '掛け合い'], ['fill', '合いの手'], ['run', 'サビへの駆け上がり'], ['ending', '最後の音']];
+    const items = [['pad', 'そっと伴奏（歌の裏）'], ['arp', '分散和音'], ['rhythm', '刻み'], ['counter', '対旋律'], ['solo', 'ソロ'], ['riff', 'リフのまね'], ['double', '楽器のメロディを弾く'], ['copy', '楽器のフレーズをまねる'], ['answer', '掛け合い'], ['fill', '合いの手'], ['run', 'サビへの駆け上がり'], ['pattern', '選んだ型（パターン）'], ['ending', '最後の音']];
     $('legend').replaceChildren(...items.map(([k, t]) => {
       const s = document.createElement('span');
       const i = document.createElement('i');
@@ -518,7 +568,7 @@ function renderSections() {
     const el = document.createElement('div');
     el.className = 'sec';
     el.dataset.i = i;
-    el.style.borderLeftColor = p.role === 'rest' ? '#555' : ROLE_COLOR[p.role];
+    el.style.borderLeftColor = p.patternId ? ROLE_COLOR.pattern : p.role === 'rest' ? '#555' : ROLE_COLOR[p.role];
     const row = document.createElement('div');
     row.className = 'row';
     const nm = document.createElement('span');
@@ -562,10 +612,355 @@ function renderSections() {
       else S.settings.roles[i] = sel.value;
       recompose();
     });
-    el.append(row, row2, sel);
+    // 型（パターン）：選ぶと、この区間はその型で弾く（上の弾き方より優先）
+    const psel = document.createElement('select');
+    psel.className = 'pat';
+    psel.title = '型（パターン）を選ぶと、この区間はその型で弾きます。音はその場のコードと調に合わせます';
+    const o0 = document.createElement('option');
+    o0.value = '';
+    o0.textContent = '型：使わない（上の弾き方で）';
+    psel.append(o0);
+    for (const [cat, label] of CATEGORIES) {
+      const list = cat === 'custom' ? S.settings.customPatterns : PATTERNS.filter((q) => q.cat === cat);
+      if (!list.length) continue;
+      const og = document.createElement('optgroup');
+      og.label = label;
+      for (const q of list) { const o = document.createElement('option'); o.value = q.id; o.textContent = `型：${q.name}`; og.append(o); }
+      psel.append(og);
+    }
+    psel.value = S.settings.patterns[i] && findPattern(S.settings.patterns[i], S.settings.customPatterns) ? S.settings.patterns[i] : '';
+    psel.addEventListener('change', () => {
+      if (psel.value) S.settings.patterns[i] = psel.value;
+      else delete S.settings.patterns[i];
+      recompose();
+    });
+    if (p.patternId) { sel.disabled = true; sel.title = '型を選んでいる間は、型が優先です'; }
+    el.append(row, row2, sel, psel);
+    if (S.arrMode === 'trio' && S.trio.guitar) {
+      const gp = S.trio.guitar.plan.find((q) => q.si === i);
+      const gsel = document.createElement('select');
+      gsel.className = 'gtr';
+      for (const [v, t] of [['auto', `ギター：おまかせ（${gp && gp.kind !== 'rest' && gp.name ? gp.name : '休み'}）`], ['arp', 'ギター：アルペジオ'], ['strum', 'ギター：ストローク'], ['rest', 'ギター：休む']]) {
+        const o = document.createElement('option'); o.value = v; o.textContent = t; gsel.append(o);
+      }
+      gsel.value = S.trio.roles[i] || 'auto';
+      if (S.trio.roles[i] && gp) gsel.options[0].textContent = 'ギター：おまかせ';
+      gsel.addEventListener('change', () => { if (gsel.value === 'auto') delete S.trio.roles[i]; else S.trio.roles[i] = gsel.value; recompose(); });
+      el.append(gsel);
+    }
     return el;
   });
   $('sections').replaceChildren(...cards);
+}
+
+// ───────────────────────── 再アレンジ（歌＋アコギ＋バイオリン）
+function setArrMode(mode) {
+  S.arrMode = mode === 'trio' ? 'trio' : 'add';
+  for (const b of $('arr-mode').children) b.classList.toggle('on', b.dataset.v === S.arrMode);
+  updateTrioUi();
+  if (!S.an) return;
+  const go = () => {
+    const was = S.player.playing;
+    if (was) stop();
+    updateTrioLevels();
+    recompose();
+    applyMix();
+    if (was) play();
+  };
+  if (S.arrMode === 'trio') {
+    ensureAudio();
+    toast('アコギの伴奏を作っています…');
+    ensureGuitar().then(go, () => toast('ギターの音を読み込めませんでした'));
+  } else go();
+}
+// 歌を取り出す AI（Spleeter）が置いてあるか（公開版では入れていないことがある）
+async function sepAvailable() {
+  if (S.sepOk != null) return S.sepOk;
+  try { const r = await fetch('models-sep/README.md', { cache: 'no-store' }); S.sepOk = r.ok; } catch { S.sepOk = false; }
+  updateTrioUi();
+  return S.sepOk;
+}
+function updateTrioUi() {
+  const trio = S.arrMode === 'trio';
+  if (trio && S.sepOk == null) sepAvailable();
+  const sepBtn = $('trio-sep');
+  if (S.sepOk === false) { sepBtn.disabled = true; sepBtn.textContent = 'AI で歌を取り出す（この版には入っていません）'; sepBtn.title = '歌だけのファイルを入れてください（Logic の「ステム分割」などで書き出せます）'; }
+  else if (!S.trio.sepBusy) { sepBtn.disabled = false; sepBtn.textContent = S.trio.vocalSource === 'ai' ? 'AI でもう一度取り出す' : 'AI で原曲から歌を取り出す'; }
+  $('trio-panel').hidden = !trio;
+  $('vol-guitar-wrap').hidden = !trio;
+  $('vol-song-label').textContent = trio ? '歌' : '原曲';
+  document.querySelectorAll('.trio-only').forEach((b) => (b.hidden = !trio));
+  const songBtn = [...$('mode').children].find((b) => b.dataset.mode === 'song');
+  if (songBtn) songBtn.textContent = trio ? '歌とギターだけ' : '原曲だけ';
+  const st = $('trio-vocal-state');
+  if (S.trio.vocalBuf) {
+    st.textContent = S.trio.vocalSource === 'file' ? `歌だけのファイル「${S.trio.vocalName}」を使っています${S.trio.offset ? `（曲の頭に合わせて ${S.trio.offset > 0 ? '+' : ''}${S.trio.offset.toFixed(2)} 秒ずらしました）` : ''}` : `AI で原曲から取り出した歌を使っています（${Math.round(S.trio.sepMs / 1000)} 秒かかりました）`;
+    st.classList.add('ok');
+  } else {
+    st.textContent = 'まだ取り出していません（今はギターとバイオリンだけが鳴ります）';
+    st.classList.remove('ok');
+  }
+  for (const b of $('guitar-style').children) b.classList.toggle('on', b.dataset.v === S.trio.style);
+}
+function renderTrioChords() {
+  const box = $('trio-chords');
+  if (!box || !S.trio.guitar) return;
+  const seen = new Map();
+  for (const c of S.trio.guitar.chords) { const name = chordName({ root: c.root, q: c.q }, S.an.key); if (!seen.has(name)) seen.set(name, c.frets); }
+  box.replaceChildren(...[...seen].slice(0, 24).map(([name, fr]) => { const sp = document.createElement('span'); const b = document.createElement('b'); b.textContent = name; sp.append(b, fr || ''); sp.title = '押さえ方（6 弦→1 弦。x＝弾かない、数字＝フレット）'; return sp; }));
+}
+function trioChordChartHtml() {
+  const esc = (t) => String(t).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const seen = new Map();
+  for (const c of S.trio.guitar.chords) { const name = chordName({ root: c.root, q: c.q }, S.an.key); if (!seen.has(name)) seen.set(name, c.frets); }
+  const secs = S.trio.guitar.plan.map((p) => `${TYPE_LABEL[S.anView.sections[p.si].type]}${S.anView.sections[p.si].n}：${p.kind === 'rest' ? '休み' : p.name}`).join('　');
+  return `<div class="score-head" style="margin-bottom:10px"><p><b>アコギ</b>（6 弦→1 弦。x＝弾かない、数字＝フレット）　${[...seen].map(([n, f]) => `<b>${esc(n)}</b> ${esc(f || '')}`).join('　')}</p><p style="font-size:12px;color:#555">${esc(secs)}</p></div>`;
+}
+// 書き出し（再アレンジ）：歌・ギター・バイオリンから選んで 1 本の WAV に
+async function renderTrio(parts) {
+  if (parts.guitar) await ensureGuitar();
+  const sr = 44100, dur = S.an.duration + 2.5;
+  const oc = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
+  const limiter = oc.createDynamicsCompressor();
+  limiter.threshold.value = -1.5; limiter.knee.value = 0; limiter.ratio.value = 20; limiter.attack.value = 0.002; limiter.release.value = 0.1;
+  limiter.connect(oc.destination);
+  if (parts.vocal && S.trio.vocalBuf) {
+    const src = oc.createBufferSource();
+    src.buffer = S.trio.vocalBuf;
+    const g = oc.createGain();
+    g.gain.value = S.mix.vSong;
+    src.connect(g).connect(limiter);
+    src.start(0);
+  }
+  if (parts.guitar && S.trio.guitar) {
+    const gb = makeGuitarBus(oc, limiter);
+    gb.out.gain.value = S.mix.vGuitar;
+    scheduleGuitar(oc, S.guitar, S.trio.guitar.notes, gb.input, { songStart: 0, from: 0, tuning: S.an.tuning, level: S.trio.levels.guitar });
+  }
+  if (parts.violin) {
+    const bus = makeViolinBus(oc, limiter, { reverb: S.mix.reverb, volume: S.mix.vViolin });
+    scheduleViolin(oc, S.violin, S.result.notes, bus.input, { songStart: 0, from: 0, tuning: S.an.tuning, level: violinLevelNow() });
+  }
+  return oc.startRendering();
+}
+// 歌だけのファイルを、原曲の頭に合わせる（音の立ち上がりの並びが一番よく重なるずれ。±3 秒まで）
+function onsetEnv(buf) {
+  const hop = Math.round(buf.sampleRate * 0.01), n = Math.floor(buf.length / hop);
+  const chs = [];
+  for (let c = 0; c < buf.numberOfChannels; c++) chs.push(buf.getChannelData(c));
+  const e = new Float32Array(n);
+  for (let i = 0; i < n; i++) { let q = 0; for (let j = i * hop; j < (i + 1) * hop; j += 4) for (const d of chs) q += d[j] * d[j]; e[i] = Math.log1p(200 * Math.sqrt(q / (hop / 4))); }
+  for (let i = n - 1; i > 0; i--) e[i] = Math.max(0, e[i] - e[i - 1]);
+  e[0] = 0;
+  return e;
+}
+function alignVocal(mix, voc) {
+  const a = onsetEnv(mix), b = onsetEnv(voc);
+  let best = 0, bv = -Infinity;
+  for (let L = -300; L <= 300; L++) {
+    let q = 0;
+    for (let i = Math.max(0, L); i < Math.min(a.length, b.length + L); i += 1) q += a[i] * b[i - L];
+    if (q > bv) { bv = q; best = L; }
+  }
+  const shift = best * 0.01; // 歌を shift 秒うしろへ（負なら前へ）
+  const sr = voc.sampleRate, len = Math.ceil(mix.duration * sr);
+  const out = new AudioBuffer({ numberOfChannels: 2, length: len, sampleRate: sr });
+  for (let c = 0; c < 2; c++) {
+    const src = voc.getChannelData(Math.min(c, voc.numberOfChannels - 1)), dst = out.getChannelData(c);
+    const off = Math.round(shift * sr);
+    for (let i = 0; i < len; i++) { const j = i - off; if (j >= 0 && j < src.length) dst[i] = src[j]; }
+  }
+  return { buf: out, shift };
+}
+async function loadVocalFile(file) {
+  if (!file || !S.songBuf) return;
+  ensureAudio();
+  try {
+    const voc = await decode(await file.arrayBuffer());
+    const { buf, shift } = alignVocal(S.songBuf, voc);
+    S.trio.vocalBuf = buf;
+    S.trio.vocalSource = 'file';
+    S.trio.vocalName = file.name;
+    S.trio.offset = Math.abs(shift) >= 0.02 ? shift : 0;
+    updateTrioLevels();
+    updateTrioUi();
+    if (S.player.playing) { stop(); play(); }
+    toast('歌だけのファイルを入れました');
+  } catch (e) {
+    console.error(e);
+    toast('このファイルは読めませんでした');
+  }
+}
+async function runSeparation() {
+  if (!S.songBuf || S.trio.sepBusy) return;
+  ensureAudio();
+  let mod;
+  try { mod = await import('./engine/separate.js'); } catch (e) { toast('歌を取り出す AI を読み込めませんでした'); return; }
+  S.trio.sepBusy = true;
+  const btn = $('trio-sep'), prog = $('trio-prog');
+  btn.disabled = true;
+  prog.hidden = false;
+  prog.value = 0;
+  const t0 = performance.now();
+  $('trio-vocal-state').textContent = '歌を取り出しています…（曲の長さによって 1〜2 分。ほかの操作はできます）';
+  try {
+    const r = await mod.separateVocals(S.songBuf, { onProgress: (v) => (prog.value = v), base: 'models-sep/' });
+    const len = r.vocal[0].length;
+    const buf = new AudioBuffer({ numberOfChannels: 2, length: len, sampleRate: r.sampleRate });
+    buf.copyToChannel(r.vocal[0], 0);
+    buf.copyToChannel(r.vocal[1] || r.vocal[0], 1);
+    S.trio.vocalBuf = buf;
+    S.trio.vocalSource = 'ai';
+    S.trio.sepMs = performance.now() - t0;
+    updateTrioLevels();
+    if (S.player.playing) { stop(); play(); }
+    toast('歌を取り出しました');
+  } catch (e) {
+    console.error(e);
+    toast('歌を取り出せませんでした：' + (e.message || e), 5000);
+  } finally {
+    S.trio.sepBusy = false;
+    btn.disabled = false;
+    prog.hidden = true;
+    updateTrioUi();
+  }
+}
+
+// ───────────────────────── パターン帳：型の一覧・試聴・まとめて使う・自分で作る
+function loadCustomPatterns() {
+  try { const v = JSON.parse(localStorage.getItem('vai-custom-patterns') || '[]'); return Array.isArray(v) ? v.filter((q) => q && q.id && q.kind) : []; } catch { return []; }
+}
+function saveCustomPatterns() {
+  try { localStorage.setItem('vai-custom-patterns', JSON.stringify(S.settings.customPatterns)); } catch {}
+}
+function smallBtn(label, onClick, extra = '') {
+  const b = document.createElement('button');
+  b.className = `btn small ${extra}`.trim();
+  b.textContent = label;
+  b.addEventListener('click', onClick);
+  return b;
+}
+function renderPatternBook() {
+  const body = $('patbook-body');
+  if (!body) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'pb';
+  const top = document.createElement('div');
+  top.className = 'pb-top';
+  const note = document.createElement('span');
+  note.textContent = '試聴は、この曲の調とテンポで、よくある 4 小節の進行に当てて鳴らします（バイオリンだけ）。';
+  top.append(note, smallBtn('選んだ型を全部はずす', () => { S.settings.patterns = {}; recompose(); toast('型を全部はずしました'); }, 'ghost'));
+  wrap.append(top);
+  for (const [cat, label] of CATEGORIES) {
+    const list = cat === 'custom' ? S.settings.customPatterns : PATTERNS.filter((q) => q.cat === cat);
+    const h = document.createElement('h4');
+    h.textContent = label;
+    wrap.append(h);
+    if (!list.length) { const e = document.createElement('p'); e.className = 'pb-empty'; e.textContent = 'まだありません。下の「自分で型を作る」から作れます。'; wrap.append(e); continue; }
+    for (const q of list) {
+      const row = document.createElement('div');
+      row.className = 'pb-row';
+      row.dataset.id = q.id;
+      const t = document.createElement('div');
+      t.className = 'pb-text';
+      const b = document.createElement('b');
+      b.textContent = q.name;
+      const d = document.createElement('span');
+      d.textContent = q.desc || '';
+      t.append(b, d);
+      const acts = document.createElement('div');
+      acts.className = 'pb-acts';
+      acts.append(smallBtn('試聴', () => previewPattern(q)), smallBtn('歌の区間に', () => applyPattern(q.id, 'vocal')), smallBtn('歌のない区間に', () => applyPattern(q.id, 'inst')));
+      if (q.cat === 'custom') acts.append(smallBtn('削除', () => deleteCustomPattern(q.id), 'ghost'));
+      row.append(t, acts);
+      wrap.append(row);
+    }
+  }
+  wrap.append(customPatternForm());
+  body.replaceChildren(wrap);
+}
+function applyPattern(id, which) {
+  if (!S.anView) return;
+  let n = 0;
+  S.anView.sections.forEach((s, i) => { if ((which === 'vocal' && s.vocal) || (which === 'inst' && !s.vocal)) { S.settings.patterns[i] = id; n++; } });
+  if (!n) { toast(which === 'vocal' ? '歌の区間がありません' : '歌のない区間がありません'); return; }
+  recompose();
+  const q = findPattern(id, S.settings.customPatterns);
+  toast(`${n} か所の区間を「${q ? q.name : id}」で弾きます`);
+}
+function deleteCustomPattern(id) {
+  S.settings.customPatterns = S.settings.customPatterns.filter((q) => q.id !== id);
+  saveCustomPatterns();
+  let used = false;
+  for (const k of Object.keys(S.settings.patterns)) if (S.settings.patterns[k] === id) { delete S.settings.patterns[k]; used = true; }
+  renderPatternBook();
+  if (used) recompose(); else if (S.result) renderSections();
+}
+let previewStop = null;
+function stopPreview() { if (previewStop) { previewStop(); previewStop = null; } }
+async function previewPattern(q) {
+  if (!S.violin) { toast('バイオリンの音を準備しています。少し待ってから押してください'); return; }
+  ensureAudio();
+  if (S.ctx.state !== 'running') { try { await S.ctx.resume(); } catch {} }
+  stop();
+  stopPreview();
+  const key = S.an ? S.an.key : { tonic: 0, mode: 'maj' };
+  const bpm = S.an ? Math.max(60, Math.min(160, S.an.bpm)) : 100;
+  const r = patternPreview(q, { tonic: key.tonic, mode: key.mode, bpm });
+  const sched = scheduleViolin(S.ctx, S.violin, r.notes, S.bus.input, { songStart: S.ctx.currentTime + 0.1, tuning: S.an ? S.an.tuning : 0, level: S.violinLevel });
+  const timer = setTimeout(stopPreview, (r.duration + 2) * 1000);
+  previewStop = () => { clearTimeout(timer); sched.stop(); };
+  S.lastPreview = { id: q.id, notes: r.notes.length };
+  toast(`試聴：${q.name}（${r.chords.map((c) => pcName(c.root, key) + (c.q === 'min' ? 'm' : '')).join(' → ')}）`, 3500);
+}
+function customPatternForm() {
+  const f = document.createElement('div');
+  f.className = 'pb-form';
+  const opt = (obj, fmt) => Object.entries(obj).map(([k, v]) => `<option value="${k}">${fmt ? fmt(v) : v}</option>`).join('');
+  f.innerHTML = `<h4>自分で型を作る</h4>
+    <div class="pb-grid">
+      <label>名前 <input id="pf-name" maxlength="24" placeholder="例：わたしの 1・5・8"></label>
+      <label>作り方 <select id="pf-kind"><option value="chord">和音の音で（1・3・5・8 など）</option><option value="steps">音階の動きで（0・1・2・1 など）</option></select></label>
+      <label class="wide">音の並び <input id="pf-tokens" placeholder="例：1 5 8 5"></label>
+      <label>リズム <select id="pf-rhythm">${opt(RHYTHMS, (v) => v[0])}<option value="custom">自分で書く…</option></select></label>
+      <label id="pf-rc" hidden>リズム（x＝音・-＝のばす・.＝休み・16 文字） <input id="pf-rcustom" maxlength="16" placeholder="x.x-x.x-x.x-x.x-"></label>
+      <label>弾き方 <select id="pf-art">${opt(ARTS)}</select></label>
+      <label>重音 <select id="pf-dbl">${opt(DOUBLES)}</select></label>
+    </div>
+    <p class="pb-help">和音の音：1＝根音・3＝3度・5＝5度・7＝7度・8＝根音のオクターブ上・10＝3度のオクターブ上・12＝5度のオクターブ上・-5＝根音の下の 5度。<br>音階の動き：0＝その場の和音の音、1＝音階で 1 つ上、-1＝1 つ下。どちらも、リズムの音ごとに順にくり返します（小節ごとに最初から）。</p>
+    <div class="pb-formacts"><button class="btn small" id="pf-try">試聴</button><button class="btn small primary" id="pf-save">保存して使えるようにする</button><span class="pb-err" id="pf-err"></span></div>`;
+  const q = (sel) => f.querySelector(sel);
+  q('#pf-art').value = 'detache';
+  q('#pf-kind').addEventListener('change', () => { q('#pf-tokens').placeholder = q('#pf-kind').value === 'steps' ? '例：0 1 2 1' : '例：1 5 8 5'; });
+  q('#pf-rhythm').addEventListener('change', () => { q('#pf-rc').hidden = q('#pf-rhythm').value !== 'custom'; });
+  const read = () => {
+    const r = parseCustom({ name: q('#pf-name').value || `自分の型 ${S.settings.customPatterns.length + 1}`, kind: q('#pf-kind').value, tokens: q('#pf-tokens').value, rhythm: q('#pf-rhythm').value === 'custom' ? q('#pf-rcustom').value : q('#pf-rhythm').value, art: q('#pf-art').value, dbl: q('#pf-dbl').value });
+    q('#pf-err').textContent = r.ok ? '' : r.error;
+    return r.ok ? r.pattern : null;
+  };
+  q('#pf-try').addEventListener('click', () => { const p = read(); if (p) previewPattern(p); });
+  q('#pf-save').addEventListener('click', () => {
+    const p = read();
+    if (!p) return;
+    S.settings.customPatterns = [...S.settings.customPatterns, p];
+    saveCustomPatterns();
+    renderPatternBook();
+    if (S.result) renderSections();
+    toast(`「${p.name}」を保存しました。区間のカードの「型」から選べます`);
+  });
+  return f;
+}
+
+// テンポの説明：一定／ほぼ一定（揺れる所だけ小節ごと）／揺れあり（小節ごとに合わせ直す。範囲つき）
+function tempoNote(an) {
+  if (an.steadyTempo) return '（一定。打ち込みの曲のようです）';
+  if (an.tempoFollow && (an.tempoGridShare ?? 0) >= 0.8) return '（ほぼ一定。はじめ・終わりなど揺れる所だけ、小節ごとに合わせ直しています）';
+  if (an.tempoFollow) {
+    const tc = (an.tempoCurve || []).filter((v) => v > 0).sort((a, b) => a - b);
+    const rng = tc.length ? `：約 ${Math.round(tc[Math.floor(tc.length * 0.05)])}〜${Math.round(tc[Math.floor(tc.length * 0.95)])} BPM` : '';
+    return `（揺れあり。小節ごとにテンポを合わせ直しています${rng}）`;
+  }
+  return '（揺れあり。拍を 1 つずつ追いかけます）';
 }
 
 function renderFound() {
@@ -586,6 +981,10 @@ function renderFound() {
   const leadSecs = inst.filter((s) => leadStrong(S.an, s));
   if (an.groove && an.groove.some((g) => g)) lines.push('<p><b>ドラム・ベース</b>：小節ごとに、キック・スネア・ハイハットの入る 16 分を聞き取りました → 刻みはそこに乗せ、ソロ・対旋律もそのリズムに寄せて、強い所に軽くアクセントをつけます</p>');
   lines.push(`<p><b>楽器のメロディ</b>：${leadSecs.length ? `${leadSecs.map((s) => `${TYPE_LABEL[s.type]}${s.n}`).join('、')} で、ギター・ピアノなどの目立つ旋律を聞き取りました → バイオリンが同じ旋律を弾きます（楽器が休む所は前後へつながる線でうめます）` : '歌のないところに、はっきりした楽器の旋律は見つかりませんでした（区間の役割で「メロディを弾く」も選べます）'}。歌の息つぎに楽器が入れるフレーズは、バイオリンでまねます</p>`);
+  if (S.arrMode === 'trio' && S.trio.guitar) {
+    const kinds = S.trio.guitar.plan.filter((q) => q.kind !== 'rest').map((q) => q.name);
+    lines.push(`<p><b>再アレンジ（歌＋アコギ＋バイオリン）</b>：歌は${S.trio.vocalBuf ? (S.trio.vocalSource === 'file' ? '歌だけのファイル' : 'AI で原曲から取り出したもの') : 'まだありません'}。アコギは、聞き取ったコードを、指 4 本で押さえられて前のコードから手があまり動かない形で弾きます（${[...new Set(kinds)].join('・')}）。バイオリンは、ギターと歌の音を「鳴っている音」として、ぶつからないように作ります</p>`);
+  }
   lines.push('<p><b>アレンジの型</b>（YouTube の弦アレンジ・バイオリン講座 61 本で多くが言っていたこと）：1番の Aメロは低く控えめに入り、サビのたびに少しずつ高く、最後のサビが頂点／歌と同じ音・同じ音域でかぶせない／歌が細かく動く間はのばし、休む・のばす間に動く／長い音は和音が変わっても共通の音を保つ／サビの頭へ駆け上がり、Bメロの終わりは 8 分の刻みで押し上げる／サビが終わったら急に切らずにのばして消える／ソロは短い動機を高さを変えてくり返し、最後に戻る／最後のサビの山場と最後の音は重音</p>');
   if (S.an.vocalLine) lines.push('<p><b>掛け合い</b>：歌のフレーズが終わった息つぎで、その終わりの形をまねて答えます（サビは歌と同じメロディを重ねることもできます：区間の役割「メロディを弾く」）</p>');
   const keys = [];
@@ -598,7 +997,7 @@ function renderFound() {
     const li = phraseInfo();
     if (li) lines.push(`<p><b>ソロのフレーズ</b>：ギタリストの実際のソロ演奏（GuitarSet）から学んだ ${li.count} 個のフレーズを、この曲のコードに合わせて置きかえて弾きます</p>`);
   }
-  lines.push(`<p><b>テンポ</b>：${an.bpm.toFixed(2)} BPM ${an.steadyTempo ? '（一定。打ち込みの曲のようです）' : '（揺れあり。拍を1つずつ追いかけます）'}・ピッチ ${an.tuning >= 0 ? '+' : ''}${an.tuning.toFixed(1)} セント（バイオリンも合わせます）</p>`);
+  lines.push(`<p><b>テンポ</b>：${an.bpm.toFixed(2)} BPM ${tempoNote(an)}・ピッチ ${an.tuning >= 0 ? '+' : ''}${an.tuning.toFixed(1)} セント（バイオリンも合わせます）</p>`);
   $('found-body').innerHTML = lines.join('');
 }
 
@@ -610,7 +1009,14 @@ function applyMix() {
   S.songGain.gain.setTargetAtTime(songOn ? S.mix.vSong : 0, t, 0.02);
   S.bus.setVolume(vOn ? S.mix.vViolin : 0, t);
   S.bus.setReverb(S.mix.reverb, t);
+  if (S.guitarBus) S.guitarBus.setVolume(S.arrMode === 'trio' && songOn ? S.mix.vGuitar : 0, t);
 }
+// 再アレンジのときの音量：歌の大きさに合わせて、ギターとバイオリンを決める（歌がまだなければ原曲から）
+function updateTrioLevels() {
+  const ref = S.trio.vocalBuf ? loudnessOf(S.trio.vocalBuf) : loudnessOf(S.songBuf) * 0.6;
+  S.trio.levels = { violin: (ref / 0.1) * 0.6, guitar: Math.max(0.15, Math.min(3, (ref / 0.1) * 0.75)) };
+}
+const violinLevelNow = () => (S.arrMode === 'trio' ? S.trio.levels.violin : S.violinLevel);
 function currentTime() {
   const p = S.player;
   if (!p.playing) return p.offset;
@@ -618,19 +1024,24 @@ function currentTime() {
 }
 async function play() {
   if (!S.songBuf || !S.violin) return;
+  stopPreview();
   ensureAudio();
   if (S.ctx.state !== 'running') { try { await S.ctx.resume(); } catch {} }
   const p = S.player;
   if (p.playing) return;
   if (p.offset >= S.an.duration - 0.05) p.offset = 0;
+  const trio = S.arrMode === 'trio';
+  if (trio) { try { await ensureGuitar(); } catch (e) { toast('ギターの音を読み込めませんでした'); return; } }
   const when = S.ctx.currentTime + 0.08;
   const src = S.ctx.createBufferSource();
-  src.buffer = S.songBuf;
-  src.connect(S.songGain);
+  // 再アレンジ：歌（取り出したもの）を鳴らす。まだなければ、原曲は音を出さずに時計の代わりにだけ使う
+  src.buffer = trio && S.trio.vocalBuf ? S.trio.vocalBuf : S.songBuf;
+  src.connect(trio && !S.trio.vocalBuf ? S.silentGain : S.songGain);
   src.start(when, p.offset);
   p.src = src;
   p.startAt = when - p.offset;
-  p.sched = scheduleViolin(S.ctx, S.violin, S.result.notes, S.bus.input, { songStart: p.startAt, from: p.offset, tuning: S.an.tuning, level: S.violinLevel });
+  p.sched = scheduleViolin(S.ctx, S.violin, S.result.notes, S.bus.input, { songStart: p.startAt, from: p.offset, tuning: S.an.tuning, level: violinLevelNow() });
+  p.gsched = trio && S.trio.guitar && S.guitar ? scheduleGuitar(S.ctx, S.guitar, S.trio.guitar.notes, S.guitarBus.input, { songStart: p.startAt, from: p.offset, tuning: S.an.tuning, level: S.trio.levels.guitar }) : null;
   p.playing = true;
   src.onended = () => { if (p.src === src && p.playing && currentTime() >= S.an.duration - 0.2) { stop(); p.offset = 0; updateTime(); } };
   $('play').classList.add('playing');
@@ -645,6 +1056,8 @@ function stop() {
   p.src = null;
   p.sched && p.sched.stop();
   p.sched = null;
+  p.gsched && p.gsched.stop();
+  p.gsched = null;
   $('play').classList.remove('playing');
 }
 function seek(t) {
@@ -660,7 +1073,9 @@ function rescheduleViolin() {
   if (!p.playing) return;
   p.sched && p.sched.stop();
   const from = currentTime() + 0.05;
-  p.sched = scheduleViolin(S.ctx, S.violin, S.result.notes, S.bus.input, { songStart: p.startAt, from, tuning: S.an.tuning, level: S.violinLevel });
+  p.sched = scheduleViolin(S.ctx, S.violin, S.result.notes, S.bus.input, { songStart: p.startAt, from, tuning: S.an.tuning, level: violinLevelNow() });
+  p.gsched && p.gsched.stop();
+  p.gsched = S.arrMode === 'trio' && S.trio.guitar && S.guitar ? scheduleGuitar(S.ctx, S.guitar, S.trio.guitar.notes, S.guitarBus.input, { songStart: p.startAt, from, tuning: S.an.tuning, level: S.trio.levels.guitar }) : null;
 }
 let rafId = 0;
 function tick() {
@@ -709,14 +1124,24 @@ async function doExport(kind) {
       });
       // 駆け上がり（5〜7 連符）は拍にそろえず、そのままのタイミングで
       const runs = S.result.notes.filter((n) => n.role === 'run').map((n) => ({ t: n.t, d: n.d, midi: n.midi, vel: n.vel, art: n.art }));
-      download(notesToMidi(q.concat(runs).sort((a, b) => a.t - b.t), an, { title: S.fileName }), `${S.fileName}_バイオリン.mid`);
-      note.textContent = 'MIDI を保存しました（Logic にドラッグすると、曲のテンポと小節線も合います）';
+      const extra = S.arrMode === 'trio' && S.trio.guitar ? [{ name: 'Acoustic Guitar', program: 25, channel: 1, notes: S.trio.guitar.notes }] : [];
+      download(notesToMidi(q.concat(runs).sort((a, b) => a.t - b.t), an, { title: S.fileName, extraTracks: extra }), `${S.fileName}_${extra.length ? 'バイオリンとギター' : 'バイオリン'}.mid`);
+      note.textContent = extra.length ? 'MIDI を保存しました（バイオリンとアコギの 2 トラック。Logic にドラッグすると、曲のテンポと小節線も合います）' : 'MIDI を保存しました（Logic にドラッグすると、曲のテンポと小節線も合います）';
       return;
     }
     if (kind === 'score') { openScore(); return; }
     if (kind === 'musicxml') { saveMusicXML(); note.textContent = 'MusicXML を保存しました（Logic・MuseScore などで楽譜として開けます）'; return; }
     note.textContent = '書き出しています…（曲の長さによって数十秒かかります）';
     await new Promise((r) => setTimeout(r, 30));
+    if (S.arrMode === 'trio') {
+      if (kind === 'vocal' && !S.trio.vocalBuf) { note.textContent = '歌がまだありません（「AI で原曲から歌を取り出す」か「歌だけのファイルを入れる」）'; return; }
+      const parts = { mix: { vocal: true, guitar: true, violin: true }, violin: { violin: true }, guitar: { guitar: true }, vocal: { vocal: true } }[kind] || { violin: true };
+      const buf = await renderTrio(parts);
+      const label = { mix: '歌とアコギとバイオリン', violin: 'バイオリンだけ', guitar: 'ギターだけ', vocal: '歌だけ' }[kind];
+      download(audioBufferToWav(buf), `${S.fileName}_${label}.wav`);
+      note.textContent = '保存しました（ダウンロードフォルダ）';
+      return;
+    }
     const buf = await renderMix({
       song: S.songBuf, violin: S.violin, notes: S.result.notes,
       includeSong: kind === 'mix', includeViolin: true,
@@ -751,7 +1176,7 @@ function openScore() {
     scoreStyleAdded = true;
   }
   const sc = currentScore();
-  $('score-page').innerHTML = renderScore(sc, { width: 940, keyText: keyText() });
+  $('score-page').innerHTML = (S.arrMode === 'trio' && S.trio.guitar ? trioChordChartHtml() : '') + renderScore(sc, { width: 940, keyText: keyText() });
   $('score-view').hidden = false;
   document.body.classList.add('score-open');
   fitClefs($('score-page'));
@@ -804,7 +1229,7 @@ async function refix(kind) {
   toast(kind === 'key' ? '調を変えて作り直しています…' : '拍を数え直しています…', 4000);
   try {
     await runAnalysis();
-    if (kind !== 'key') { S.settings.roles = {}; S.settings.vocal = {}; }
+    if (kind !== 'key') { S.settings.roles = {}; S.settings.vocal = {}; S.settings.patterns = {}; }
     S.view.peaks = null;
     recompose();
     toast(kind === 'key' ? `調を ${keyNameTrad(S.an.key)} にして作り直しました` : `${S.an.meter}拍子・テンポ ${S.an.bpm.toFixed(1)} BPM で作り直しました`);
@@ -845,6 +1270,11 @@ $('mode').addEventListener('click', (e) => {
 });
 $('vol-violin').addEventListener('input', (e) => { S.mix.vViolin = +e.target.value; applyMix(); savePrefs(); });
 $('vol-song').addEventListener('input', (e) => { S.mix.vSong = +e.target.value; applyMix(); savePrefs(); });
+$('vol-guitar').addEventListener('input', (e) => { S.mix.vGuitar = +e.target.value; applyMix(); });
+$('arr-mode').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b && b.dataset.v !== S.arrMode) setArrMode(b.dataset.v); });
+$('guitar-style').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; S.trio.style = b.dataset.v; updateTrioUi(); if (S.an) recompose(); });
+$('trio-sep').addEventListener('click', () => runSeparation());
+$('trio-vocal-file').addEventListener('change', (e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; loadVocalFile(f); });
 $('reverb').addEventListener('input', (e) => { S.mix.reverb = +e.target.value; applyMix(); savePrefs(); });
 $('style').addEventListener('click', (e) => {
   const b = e.target.closest('button');
@@ -923,4 +1353,4 @@ window.addEventListener('resize', () => {
 });
 
 // テスト用に中を見られるようにする
-window.__violinAI = { S, handleFile, play, stop, seek, recompose, refix, doExport, openScore, closeScore, currentScore, yamnetListen, decode, ensureAudio };
+window.__violinAI = { S, handleFile, play, stop, seek, recompose, refix, doExport, openScore, closeScore, currentScore, yamnetListen, decode, ensureAudio, previewPattern, applyPattern, renderPatternBook, setArrMode, loadVocalFile, runSeparation, renderTrio };

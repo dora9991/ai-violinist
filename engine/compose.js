@@ -3,6 +3,7 @@
 import { scaleOf, MAJOR_SCALE, MINOR_SCALE } from './analyze.js';
 import { genSoloV3 } from './solo.js';
 import { genLine, hasLineModel, connectLp, dynamicsFor } from './line.js';
+import { findPattern, normalizePattern } from './patterns.js';
 export { setPhrases, phraseInfo } from './solo.js';
 export { setLineModel, lineModelInfo, lineScore } from './line.js';
 
@@ -1194,6 +1195,372 @@ function addEnding(ctx, out) {
   if (tEnd - t > 0.8) out.push({ t, d: tEnd - t, midi: m, vel: 0.5, art: 'sneak', legato: false, shape: 'fade', role: 'ending', vib: 1, sec: an.sections.length - 1 });
 }
 
+// ───────────────────────── 型（パターン）で弾く：1・5・8、スケール、リックなど（patterns.js）。
+// 音の高さは、その場のコード（度数）と調の音階で決める。拍の頭・長い音は原曲と濁らない音に直す
+const pentaOf = (key) => (key.mode === 'min' ? [0, 3, 5, 7, 10] : [0, 2, 4, 7, 9]).map((v) => (v + key.tonic) % 12);
+function chordAt(ctx, x) {
+  const an = ctx.an;
+  const ch = an.chords[clamp(Math.floor(x + 1e-6), 0, Math.max(0, an.chords.length - 1))];
+  if (ch) return ch;
+  const k = ctx.keyAt(x), minor = k.mode === 'min';
+  return { root: k.tonic, q: minor ? 'min' : 'maj', pcs: [k.tonic, (k.tonic + (minor ? 3 : 4)) % 12, (k.tonic + 7) % 12] };
+}
+// コードの度数 → 根音からの半音（3 度・7 度はコードの種類で決まる）
+function degOffset(tok, ch) {
+  const t3 = /min/.test(ch.q) ? 3 : 4, t7 = ch.q === 'maj7' ? 11 : 10;
+  const T = { 1: 0, 2: 2, 3: t3, 4: 5, 5: 7, 6: 9, 7: t7, 8: 12, 9: 14, 10: 12 + t3, 11: 17, 12: 19, 13: 21, 15: 24, '-3': t3 - 12, '-5': -5, '-7': t7 - 12, '-8': -12 };
+  return T[tok] ?? 0;
+}
+function rhythmOnsets(str, steps) {
+  let s = String(str || 'x-x-x-x-x-x-x-x-');
+  while (s.length < steps) s += s;
+  s = s.slice(0, steps);
+  const out = [];
+  for (let k = 0; k < steps; k++) {
+    if (s[k] !== 'x') continue;
+    let len = 1;
+    while (k + len < steps && s[k + len] === '-') len++;
+    out.push({ k, len });
+  }
+  return out;
+}
+// 音域：歌の区間は伴奏の音域（歌とかぶせない）、歌のない区間は少し高め。型が広いときは上に広げる
+function patternRegister(ctx, item) {
+  if (item.sec.vocal) { const r = registerFor(ctx, item, 'pad'); return { lo: Math.max(LOW, r.lo), hi: Math.min(HIGH, Math.max(r.hi, r.lo + 17)), center: r.center + 3 }; }
+  return { lo: 57, hi: HIGH, center: clamp(72 + 2 * ((item.level ?? 2) - 2), 67, 79) };
+}
+// 和音の型の根音の高さ：型の音が音域に入り、真ん中が目安に近く、前の根音から離れすぎない
+function chooseRoot(rootPc, offs, reg, prevR) {
+  const lo = Math.min(...offs), hi = Math.max(...offs), mid = (lo + hi) / 2;
+  let best = null, bs = Infinity;
+  for (let r = rootPc + 36; r <= 96; r += 12) {
+    let c = Math.abs(r + mid - reg.center);
+    if (r + lo < LOW) c += 50;
+    if (r + hi > HIGH) c += 50;
+    if (r + lo < reg.lo) c += 2 * (reg.lo - r - lo);
+    if (r + hi > reg.hi) c += 2 * (r + hi - reg.hi);
+    if (prevR != null) c += 0.4 * Math.abs(r - prevR);
+    if (c < bs) { bs = c; best = r; }
+  }
+  return best;
+}
+const stepN = (m, n, sc) => { let x = m; for (let k = 0; k < Math.abs(n); k++) x = stepScale(x, Math.sign(n), sc); return x; };
+// 重音の下の音（3度・6度は音階で、オクターブ・5度は半音で）。濁るなら重ねない
+function dblBelow(ctx, m, x, xe, tok) {
+  if (!tok) return null;
+  const q = tok === '8-' ? m - 12 : tok === '5-' ? m - 7 : stepN(m, tok === '6-' ? -5 : -2, ctx.scalePcs(x));
+  if (q < LOW) return null;
+  for (let k = x; k < xe - 0.01; k += 0.5) if (ctx.tension(q, k) > 1) return null;
+  return q;
+}
+function patNote(ctx, item, pat, x, lenBeats, m, j, kStep) {
+  const t = ctx.beatTime(x), te = ctx.beatTime(x + lenBeats);
+  const full = te - t, a = pat.art;
+  const vel = clamp(0.28 + 0.42 * item.intensity + (kStep === 0 ? 0.06 : kStep % 4 === 0 ? 0.03 : 0) + 0.08 * (ctx.accentAtStep(Math.round(x * 4)) - 0.4), 0.15, 0.9);
+  const n = {
+    t, d: a === 'detache' ? full * 0.9 : a === 'spic' ? Math.min(full * 0.5, 0.18) : full,
+    midi: clamp(Math.round(m), LOW, HIGH), vel, art: a === 'pizz' ? 'pizz' : a === 'trem' ? 'trem' : 'sus',
+    legato: a === 'legato' && j > 0, shape: full >= 0.9 && a !== 'pizz' ? 'swell' : 'flat', role: 'pattern', sec: item.si,
+  };
+  if (lenBeats >= 2 && a !== 'pizz') n.vib = 1;
+  const q = dblBelow(ctx, n.midi, x, x + lenBeats, pat.dbl);
+  if (q != null) n.dbl = q;
+  return n;
+}
+// 拍の頭・長い音が原曲と濁るなら、近い和音の音へ
+const safeAt = (ctx, m, x, strong) => (ctx.tension(m, x) > (strong ? 1 : 1) ? nearestIn(m, ctx.chordPcs(x), LOW, HIGH) : m);
+
+// 和音の型（1・5・8 など）
+function genChordPattern(ctx, item, out, prevNote, pat) {
+  const bars = sectionBars(ctx.an, item.sec).filter((b) => !b.pickup);
+  const reg = patternRegister(ctx, item);
+  let r = null, last = prevNote;
+  for (const bar of bars) {
+    rhythmOnsets(pat.rhythm, bar.n * 4).forEach((o, j) => {
+      const x = bar.b0 + o.k / 4;
+      const ch = chordAt(ctx, x);
+      const offs = pat.degs.map((d) => degOffset(d, ch));
+      r = chooseRoot(ch.root, offs, reg, r);
+      const m = safeAt(ctx, r + offs[j % offs.length], x, true);
+      const n = patNote(ctx, item, pat, x, o.len / 4, m, j, o.k);
+      out.push(n);
+      last = n;
+    });
+  }
+  return last;
+}
+
+// 音階の型（自分で作る：和音の音から 0・+1・+2…）。小節ごとに、その場の和音の音（前の始まりに近い 3 度か 5 度）から
+function genStepsPattern(ctx, item, out, prevNote, pat) {
+  const bars = sectionBars(ctx.an, item.sec).filter((b) => !b.pickup);
+  const reg = patternRegister(ctx, item);
+  const span = Math.max(...pat.steps) - Math.min(...pat.steps);
+  let anchor = prevNote ? prevNote.midi : reg.center, last = prevNote;
+  for (const bar of bars) {
+    const x0 = bar.b0;
+    const ch = chordAt(ctx, x0);
+    const pcs = [(ch.root + degOffset('3', ch)) % 12, (ch.root + 7) % 12];
+    anchor = nearestIn(clamp(anchor, reg.lo + 2, reg.hi - Math.min(12, span) - 2), pcs, LOW, HIGH);
+    rhythmOnsets(pat.rhythm, bar.n * 4).forEach((o, j) => {
+      const x = x0 + o.k / 4;
+      let m = stepN(anchor, pat.steps[j % pat.steps.length], ctx.scalePcs(x));
+      while (m > HIGH) m -= 12;
+      while (m < LOW) m += 12;
+      if (o.k % 4 === 0 || o.len >= 4) m = safeAt(ctx, m, x, true);
+      const n = patNote(ctx, item, pat, x, o.len / 4, m, j, o.k);
+      out.push(n);
+      last = n;
+    });
+  }
+  return last;
+}
+
+// その場のコードのペンタトニック（メジャーのコードはメジャー、マイナーのコードはマイナー）。調の外の音は使わない
+function chordPentaAt(ctx, x) {
+  const ch = chordAt(ctx, x);
+  const base = (/min/.test(ch.q) ? [0, 3, 5, 7, 10] : [0, 2, 4, 7, 9]).map((v) => (v + ch.root) % 12);
+  const ok = new Set([...ctx.scalePcs(x), ...ctx.chordPcs(x)]);
+  const f = base.filter((pc) => ok.has(pc));
+  return f.length >= 4 ? f : pentaOf(ctx.keyAt(x));
+}
+
+// 拍の頭は和音の音、あいだは音階の経過音（拍から拍へ、音階で歩く。上がりきったら向きを変える）
+//   beats＝[{ x, dir }]、npb＝1 拍の音の数（8 分＝2、16 分＝4）。返り値＝[{ x, m }]
+//   1 音が 0.18 秒以上ある（8 分や遅い 16 分）ときは、原曲の和音と半音でこすれる経過音（例：C のコードの F・B）を飛ばす
+function walkBeats(ctx, beats, npb, lo, hi, pcsAt, startM) {
+  const out = [];
+  const tones = (x) => { const pcs = ctx.chordPcs(x); const r = []; for (let q = lo; q <= hi; q++) if (pcs.includes(pcOf(q))) r.push(q); return r; };
+  const slow = (x) => ctx.beatLen(x) / npb >= 0.18;
+  const path = (a, b, x) => { const sc = pcsAt(x), r = []; const d = Math.sign(b - a); for (let q = a + d; d && (d > 0 ? q < b : q > b); q += d) if (sc.includes(pcOf(q)) && !(slow(x) && ctx.tension(q, x + 0.5) > 1)) r.push(q); return r; };
+  let c = null;
+  beats.forEach((bt, i) => {
+    const ts = tones(bt.x);
+    if (c == null) c = ts.length ? ts.reduce((p, q) => (Math.abs(q - startM) < Math.abs(p - startM) ? q : p)) : clamp(startM, lo, hi);
+    out.push({ x: bt.x, m: c });
+    const nx = beats[i + 1];
+    const xNext = nx ? nx.x : bt.x + 1;
+    let d = bt.dir;
+    // 次の拍の和音の音：向きの先で、音階でちょうど npb 段くらい離れたもの（なければ向きを変える）
+    let target = null;
+    for (let tries = 0; tries < 2 && target == null; tries++) {
+      let bestC = Infinity;
+      for (const q of tones(xNext)) {
+        if (d > 0 ? q <= c : q >= c) continue;
+        const st = path(c, q, bt.x).length + 1;
+        const cost = Math.abs(st - npb) + 0.01 * Math.abs(q - c);
+        if (cost < bestC) { bestC = cost; target = q; }
+      }
+      if (target == null) d = -d;
+    }
+    if (target == null) target = c;
+    // あいだの経過音（npb − 1 個）。足りなければ着く音のとなりから回り込み、多ければ着く音に近い方を使う
+    let p = path(c, target, bt.x);
+    if (p.length > npb - 1) p = p.slice(p.length - (npb - 1));
+    while (p.length < npb - 1) {
+      const sc = pcsAt(bt.x);
+      let q = target === c ? stepScale(c, d, sc) : stepScale(target, -Math.sign(target - c) || -d, sc);
+      if (slow(bt.x) && ctx.tension(q, bt.x + 0.5) > 1) q = p.length ? p[p.length - 1] : c; // こすれる音より、同じ音をもう一度
+      p.push(q);
+    }
+    for (let k = 0; k < npb - 1; k++) out.push({ x: bt.x + ((k + 1) * (xNext - bt.x)) / npb, m: clamp(p[k], LOW, HIGH) });
+    c = target;
+  });
+  return out;
+}
+
+// スケール（上り下りの波・3度・駆け上がって伸ばす・下りて伸ばす・半音階の駆け上がり）
+function genScalePattern(ctx, item, out, prevNote, pat) {
+  const bars = sectionBars(ctx.an, item.sec).filter((b) => !b.pickup);
+  const reg = patternRegister(ctx, item);
+  const lo = Math.max(LOW, reg.lo), hi = Math.min(HIGH, Math.max(reg.hi, lo + 14));
+  const pcsAt = (x) => (pat.penta ? chordPentaAt(ctx, x) : ctx.scalePcs(x));
+  const step = (m, d, x) => { let y = stepScale(m, d, pcsAt(x)); if (y > hi || y < lo) y = stepScale(m, -d, pcsAt(x)); return y; };
+  const ct = (m, x) => nearestIn(m, ctx.chordPcs(x), lo, hi);
+  let m = ct(prevNote ? clamp(prevNote.midi, lo + 3, hi - 3) : reg.center, bars.length ? bars[0].b0 : 0);
+  let last = prevNote;
+  const push = (x, len, mm, j, k, extra) => { const n = patNote(ctx, item, { ...pat, art: extra?.art || (len >= 1 ? 'legato' : 'detache') }, x, len, mm, j, k); if (extra?.vib) n.vib = 1; out.push(n); last = n; return n; };
+  bars.forEach((bar, bi) => {
+    const B = bar.n * 4, x0 = bar.b0;
+    if (pat.mode === 'wave') {
+      // 8 分：1 小節ごとに上り・下り。16 分：2 拍ごとに上り・下り
+      const npb = pat.unit === 1 ? 4 : 2;
+      const beats = [];
+      for (let k = 0; k < bar.n; k++) beats.push({ x: x0 + k, dir: (pat.unit === 1 ? bi * 2 + Math.floor(k / (bar.n / 2)) : bi) % 2 === 0 ? 1 : -1 });
+      walkBeats(ctx, beats, npb, lo, hi, pcsAt, m).forEach((w, j) => { push(w.x, 1 / npb, w.m, j, Math.round((w.x - x0) * 4)); m = w.m; });
+    } else if (pat.mode === 'thirds') {
+      // 3 度ずつ（上がる小節・下がる小節）。拍の頭が原曲と濁るときだけ、近い和音の音へ
+      const dir = bi % 2 === 0 ? 1 : -1;
+      for (let k = 0, j = 0; k < B; k += 2, j++) {
+        const x = x0 + k / 4;
+        if (k === 0) m = bi === 0 ? ct(m, x) : nearestIn(m + dir, ctx.chordPcs(x), lo, hi);
+        else m = j % 2 === 1 ? step(step(m, dir, x), dir, x) : step(m, -dir, x);
+        if (k % 4 === 0 && ctx.tension(m, x) > 1) { const q = nearestIn(m + dir, ctx.chordPcs(x), lo, hi); m = q === last?.midi ? nearestIn(m - dir, ctx.chordPcs(x), lo, hi) : q; }
+        push(x, 0.5, m, j, k);
+      }
+    } else if (pat.mode === 'run-hold' || pat.mode === 'fall-hold') {
+      // 2 拍で 16 分の駆け上がり（駆け下り）→ 着いた和音の音を伸ばす
+      const dir = pat.mode === 'fall-hold' ? -1 : bi % 2 === 0 ? 1 : -1;
+      const start = pat.mode === 'fall-hold' ? hi - 2 : m;
+      const runBeats = Math.max(1, Math.min(2, bar.n - 1));
+      const beats = [];
+      for (let k = 0; k <= runBeats; k++) beats.push({ x: x0 + k, dir });
+      const w = walkBeats(ctx, beats, 4, lo, hi, pcsAt, start);
+      const runN = runBeats * 4;
+      w.slice(0, runN).forEach((q, j) => push(q.x, 0.25, q.m, j, Math.round((q.x - x0) * 4)));
+      m = w[runN].m;
+      push(x0 + runBeats, bar.n - runBeats, m, runN, runBeats * 4, { art: 'legato', vib: 1 });
+    } else if (pat.mode === 'chromatic-run') {
+      if (bi % 2 === 0 && bi + 1 < bars.length) {
+        m = ct(m, x0);
+        push(x0, (B - 4) / 4, m, 0, 0, { art: 'legato', vib: 1 });
+        const nx = bars[bi + 1].b0;
+        const target = ct(m + 2, nx);
+        for (let k = 0; k < 4; k++) push(x0 + (B - 4 + k) / 4, 0.25, target - 4 + k, k + 1, B - 4 + k);
+        m = target;
+      } else {
+        m = ct(m, x0);
+        push(x0, B / 4, m, 0, 0, { art: 'legato', vib: 1 });
+      }
+    }
+  });
+  return last;
+}
+
+// リック：決まった形のフレーズを、その場の和音の音から弾く。リックのあとは伸ばす・休む・高さを変えてもう一度。
+// 歌の区間では、歌が休んでいる所だけに入れ、歌っている所はそっと伸ばす
+function genLickPattern(ctx, item, out, prevNote, pat) {
+  const an = ctx.an;
+  const bars = sectionBars(an, item.sec).filter((b) => !b.pickup);
+  const reg = patternRegister(ctx, item);
+  const L = pat.bars || 1;
+  let last = prevNote, occ = 0;
+  const vocalFree = (x0, beats) => { if (!item.sec.vocal) return 1; let f = 0, n = 0; for (let st = Math.round(x0 * 4); st < Math.round((x0 + beats) * 4); st++) { n++; if (ctx.vocalPitch(st) == null) f++; } return n ? f / n : 1; };
+  const holdBar = (bar, soft) => {
+    const x = bar.b0;
+    const m = nearestIn(last ? last.midi : reg.center, ctx.chordPcs(x), Math.max(LOW, reg.lo), reg.hi);
+    const n = patNote(ctx, item, { art: 'legato' }, x, bar.n, m, 0, 0);
+    n.vel = clamp(n.vel * (soft ? 0.7 : 0.85), 0.12, 0.8);
+    n.vib = soft ? 0 : 1;
+    out.push(n);
+    last = n;
+  };
+  const placeLick = (bs, shift) => {
+    const x0 = bs[0].b0;
+    const ch = chordAt(ctx, x0);
+    const aOff = degOffset(pat.anchor, ch);
+    const center = clamp(last ? (last.midi + reg.center) / 2 : reg.center, reg.lo + 4, reg.hi - 6);
+    // 始まりの和音の音（高さを変えるときは、1 つ上の和音の音から）
+    let anchor0 = nearestIn(Math.round(center), [(ch.root + aOff + 120) % 12], LOW, HIGH);
+    if (shift) anchor0 = nearestIn(anchor0 + 3, ctx.chordPcs(x0), LOW, HIGH);
+    const total = bs.reduce((a, b) => a + b.n * 4, 0);
+    const pitchesFor = (anchor) => pat.notes.map(([pos, , h]) => {
+      const x = x0 + pos / 4;
+      if (typeof h === 'number') return stepN(anchor, h, ctx.scalePcs(x));
+      if (h[0] === 'c') return anchor + parseInt(h.slice(1), 10);
+      if (h[0] === 'a') return anchor - aOff + degOffset(h.slice(1), chordAt(ctx, x0));
+      // ペンタトニックの段：始まりの音（その場のコードのペンタトニックに寄せる）から数える
+      const pp = chordPentaAt(ctx, x0);
+      let m = anchor;
+      while (!pp.includes(pcOf(m))) m--;
+      const nn = parseInt(h.slice(1), 10);
+      for (let k = 0; k < Math.abs(nn); k++) { do m += Math.sign(nn); while (!pp.includes(pcOf(m))); }
+      return m;
+    });
+    // リック全体が音域に入るオクターブ（跳躍をつぶさない）
+    const lo = Math.max(LOW, reg.lo - 3), hi = Math.min(HIGH, reg.hi + 3);
+    let best = null, bs2 = Infinity;
+    for (const k of [-24, -12, 0, 12, 24]) {
+      const ps = pitchesFor(anchor0 + k);
+      let c = 0;
+      for (const q of ps) { if (q < LOW || q > HIGH) c += 100; else if (q < lo) c += 3 * (lo - q); else if (q > hi) c += 3 * (q - hi); }
+      c += Math.abs(ps.reduce((a, q) => a + q, 0) / ps.length - center) * 0.3 + (Math.abs(k) / 12) * 2; // 入るならオクターブは動かさない（高さを変えたくり返しを残す）
+      if (c < bs2) { bs2 = c; best = ps; }
+    }
+    pat.notes.forEach(([pos, len, h, orn], j) => {
+      if (pos >= total) return;
+      const x = x0 + pos / 4;
+      let m = clamp(best[j], LOW, HIGH);
+      const lenB = Math.min(len, total - pos) / 4;
+      if (len >= 4 && !(typeof h === 'string' && h[0] === 'c')) m = safeAt(ctx, m, x, true); // 長い音だけ和音に合わせる（短い音は経過音）
+      else if (len >= 2 && ctx.tension(m, x) > 1 && !(typeof h === 'string' && h[0] === 'c')) { // 8 分くらいの音は、こすれるなら音階で 1 つずらす
+        const nxt = best[j + 1] ?? m, sc = ctx.scalePcs(x);
+        const q = stepScale(m, nxt >= m ? 1 : -1, sc);
+        m = ctx.tension(q, x) <= 1 ? q : stepScale(m, nxt >= m ? -1 : 1, sc);
+      }
+      const n = patNote(ctx, item, { art: len >= 3 ? 'legato' : 'detache', dbl: '' }, x, lenB, m, j, pos);
+      n.legato = j > 0 && len < 3 ? false : n.legato;
+      if (orn) { if (orn.vib) n.vib = 1; if (orn.trill) n.trill = orn.trill; if (orn.bend) n.bend = orn.bend; if (orn.slide) n.slide = orn.slide; }
+      n.vel = clamp(n.vel + 0.06, 0.15, 0.95);
+      out.push(n);
+      last = n;
+    });
+  };
+  let bi = 0;
+  while (bi < bars.length) {
+    const bs = bars.slice(bi, bi + L);
+    if (bs.length === L && vocalFree(bs[0].b0, bs.reduce((a, b) => a + b.n, 0)) >= 0.7) {
+      placeLick(bs, false);
+      bi += L;
+      occ++;
+      if (bi >= bars.length) break;
+      if (pat.resp === 'seq') {
+        const bs2 = bars.slice(bi, bi + L);
+        if (bs2.length === L && vocalFree(bs2[0].b0, bs2.reduce((a, b) => a + b.n, 0)) >= 0.7) { placeLick(bs2, true); bi += L; }
+        if (bi < bars.length) { bi++; } // ひと息
+      } else if (pat.resp === 'hold') { holdBar(bars[bi], false); bi++; } else bi++; // rest
+    } else {
+      if (item.sec.vocal) holdBar(bars[bi], true);
+      bi++;
+    }
+  }
+  void occ;
+  return last;
+}
+
+function genPattern(ctx, item, out, prevNote, pat) {
+  if (!pat) return prevNote;
+  switch (pat.kind) {
+    case 'chord': return genChordPattern(ctx, item, out, prevNote, pat);
+    case 'steps': return genStepsPattern(ctx, item, out, prevNote, pat);
+    case 'scale': return genScalePattern(ctx, item, out, prevNote, pat);
+    case 'lick': return genLickPattern(ctx, item, out, prevNote, pat);
+  }
+  return prevNote;
+}
+
+// 型の試聴：曲の調・テンポで、4 小節のよくある進行（長調 I–V–vi–IV／短調 i–VI–III–VII）に型を当てた音を返す
+export function patternPreview(patIn, { tonic = 0, mode = 'maj', bpm = 100 } = {}) {
+  const pat = normalizePattern(patIn);
+  const spb = 60 / bpm, t0 = 0.15, nBars = 4, nb = nBars * 4 + 2;
+  const beats = Array.from({ length: nb }, (_, i) => t0 + i * spb);
+  const minor = mode === 'min' || mode === 'minor';
+  const prog = minor ? [[0, 'min'], [8, 'maj'], [3, 'maj'], [10, 'maj']] : [[0, 'maj'], [7, 'maj'], [9, 'min'], [5, 'maj']];
+  const sc = scaleOf({ tonic, mode: minor ? 'min' : 'maj' });
+  const chords = [], chroma = [], barOfBeat = [], beatInBar = [];
+  for (let i = 0; i < nb; i++) {
+    const b = Math.min(nBars - 1, Math.floor(i / 4));
+    const [dg, q] = prog[b];
+    const root = (tonic + dg) % 12;
+    const pcs = [root, (root + (q === 'min' ? 3 : 4)) % 12, (root + 7) % 12];
+    chords.push({ root, q, pcs });
+    chroma.push(Array.from({ length: 12 }, (_, pc) => (pcs.includes(pc) ? 1 : sc.includes(pc) ? 0.25 : 0.03)));
+    barOfBeat.push(b);
+    beatInBar.push(i % 4);
+  }
+  const bars = Array.from({ length: nBars }, (_, b) => ({ b0: b * 4, n: 4, t0: beats[b * 4], t1: beats[b * 4 + 4], pickup: false, idx: b }));
+  const key = { tonic, mode: minor ? 'min' : 'maj' };
+  const an = {
+    beats, bpm, meter: 4, chords, chroma, key, keyPerBar: bars.map(() => key), barOfBeat, beatInBar, bars,
+    sections: [{ type: 'inter', bar0: 0, bar1: nBars, vocal: false, n: 1 }], vocalProb: new Array(nb).fill(0), vocalLine: null, groove: null, leadLine: null,
+    beatEnergy: new Array(nb).fill(1), duration: beats[nb - 1] + 1,
+  };
+  const ctx = makeCtx(an, { seed: 1, style: 'emotional', presence: 0.7, motion: 1 });
+  const item = { si: 0, sec: an.sections[0], role: 'pattern', intensity: 0.6, level: 2, auto: false };
+  const notes = [];
+  genPattern(ctx, item, notes, null, pat);
+  return { notes: finalize(ctx, notes), duration: beats[nBars * 4] + 1.2, chords: prog.map(([dg, q]) => ({ root: (tonic + dg) % 12, q })) };
+}
+
 // ───────────────────────── 区間をまたぐ組み立て（YouTube の弦アレンジ講座から）
 // イントロ：調の 5 度（合わなければ主音）をトレモロでのばして「何かが始まる」予感を作り、旋律は途中から入る。
 // 和音に合わなくなった所だけ、近い和音の音へ動く
@@ -1436,6 +1803,15 @@ export function compose(an, settings = {}) {
   plan.forEach((item, idx) => {
     const nextVocal = idx + 1 < plan.length && plan[idx + 1].sec.vocal;
     const start = notes.length;
+    // 型（パターン）が選ばれている区間は、その型で弾く
+    const pat = settings.patterns && settings.patterns[item.si] ? findPattern(settings.patterns[item.si], settings.customPatterns) : null;
+    if (pat) {
+      item.pattern = pat;
+      item.auto = false;
+      prev = genPattern(ctx, item, notes, prev, normalizePattern(pat));
+      item.noteCount = notes.length - start;
+      return;
+    }
     switch (item.role) {
       case 'pad':
         prev = genPad(ctx, item, notes, prev);
@@ -1488,5 +1864,5 @@ export function compose(an, settings = {}) {
   if (settings.ending !== false) addEnding(ctx, notes);
   if (settings.arrange !== false) addDoubleStops(ctx, plan, notes);
   const out = finalize(ctx, notes);
-  return { notes: out, plan: plan.map((p) => ({ si: p.si, role: p.role, auto: p.auto, intensity: p.intensity, type: p.sec.type, n: p.sec.n, noteCount: p.noteCount, hasRiff: !!p.riff })) };
+  return { notes: out, plan: plan.map((p) => ({ si: p.si, role: p.role, auto: p.auto, intensity: p.intensity, type: p.sec.type, n: p.sec.n, noteCount: p.noteCount, hasRiff: !!p.riff, patternId: p.pattern ? p.pattern.id : null, patternName: p.pattern ? p.pattern.name : null })) };
 }

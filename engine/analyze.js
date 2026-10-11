@@ -476,7 +476,8 @@ function refineGrid(beats, onset, fps, duration) {
     if (Math.abs(d) < 0.035 || Math.abs(Math.abs(d) - T / 2) < 0.035) agree++;
   }
   const ratio = wins ? agree / wins : 0;
-  if (!(ratio >= 0.75 || (best.snapped && ratio >= 0.55))) return { beats, steady: false, ratio };
+  // 一定でなくても、一番合う格子（T・a）は返す（小節ごとに合わせるときの目安にする）
+  if (!(ratio >= 0.75 || (best.snapped && ratio >= 0.55))) return { beats, steady: false, ratio, T: best.T, a: best.a };
   const out = [];
   const k0 = Math.ceil(-best.a / best.T);
   for (let k = k0; ; k++) {
@@ -484,7 +485,145 @@ function refineGrid(beats, onset, fps, duration) {
     if (t > duration + 1e-6) break;
     if (t >= -1e-6) out.push(Math.max(0, t));
   }
-  return { beats: out, steady: true, T: best.T, ratio, snapped: !!best.snapped };
+  return { beats: out, steady: true, T: best.T, a: best.a, ratio, snapped: !!best.snapped };
+}
+
+// ───────────────────────── 生演奏のテンポの揺れ：小節ごとに合わせ直す
+// 小節（4 拍）ごとに「頭の位置と長さ」を選ぶ動的計画法。小節の中の拍は等間隔。
+// 点数＝拍と 8 分の位置の立ち上がりの強さ（w8＝8 分の裏の重み。low・wl を渡すと拍の位置に低い音の立ち上がりも足す）。
+// 罰点＝となりの小節との長さの変化・曲全体のテンポからの離れぐあい（弱い所でさまよわないため）。
+const BAR_BEATS = 4;
+function trackBars(onset, fps, P0, w8 = 1, low = null, wl = 0) {
+  const G = BAR_BEATS, F0 = onset.length;
+  // ゆっくりの曲（1 小節が 240 フレーム＝約 2.8 秒より長い）は 2 フレームずつまとめて軽くする（拍の位置の誤差は ±12ms 以内）
+  const D = G * P0 > 240 ? 2 : 1;
+  const L0 = (G * P0) / D, F = Math.ceil(F0 / D);
+  if (!(L0 > 4 * G) || F < 3 * L0) return null;
+  // 強さをそろえる：飛び抜けた音は頭打ち・平均を 1 に
+  const level = (x) => {
+    const y = smoothOnset(x, fps);
+    const cap = percentile(y, 0.995) || 1;
+    let sum = 0;
+    for (let i = 0; i < F0; i++) { if (y[i] > cap) y[i] = cap; sum += y[i]; }
+    const mean = sum / F0 || 1;
+    for (let i = 0; i < F0; i++) y[i] /= mean;
+    return y;
+  };
+  const sm = level(onset), lw = low && wl ? level(low) : null;
+  const Lmin = Math.max(2 * G, Math.floor(L0 / 1.2)), Lmax = Math.ceil(L0 * 1.2), NL = Lmax - Lmin + 1; // 全体のテンポの ±20% まで
+  const pad = new Float32Array(F + Lmax + 2), padB = new Float32Array(F + Lmax + 2); // 8 分の裏用・拍用
+  for (let i = 0; i < F0; i++) { pad[(i / D) | 0] += (w8 * sm[i]) / D; padB[(i / D) | 0] += (sm[i] + (lw ? wl * lw[i] : 0)) / D; }
+  const dL = Math.max(1, Math.round(L0 * 0.03)), W = 2 * dL + 1; // 1 小節で変えてよい長さ（約 3%）
+  const LAM = 3000, MU = 1000;
+  const pen = new Float32Array(NL * W), prior = new Float32Array(NL);
+  const fl = new Int32Array(NL * 2 * G), fr = new Float32Array(NL * 2 * G);
+  for (let li = 0; li < NL; li++) {
+    const L = Lmin + li;
+    prior[li] = MU * Math.log(L / L0) ** 2;
+    for (let d = -dL; d <= dL; d++) pen[li * W + d + dL] = L + d > 0 ? LAM * Math.log(L / (L + d)) ** 2 : 1e9;
+    for (let k = 0; k < 2 * G; k++) { const x = (k * L) / (2 * G); fl[li * 2 * G + k] = Math.floor(x); fr[li * 2 * G + k] = x - Math.floor(x); }
+  }
+  // V は直前の Lmax フレーム分だけ持つ（長い曲でもメモリを食わない）。戻り道は Int8 で全部
+  const R = Lmax + 1;
+  const V = new Float32Array(R * NL), back = new Int8Array(F * NL);
+  const prow = new Int32Array(NL);
+  let bs = -1, bl = 0, bv = -Infinity;
+  for (let s = 0; s < F; s++) {
+    for (let lj = 0; lj < NL; lj++) { const sp = s - Lmin - lj; prow[lj] = sp >= 0 ? (sp % R) * NL : -1; }
+    const row = (s % R) * NL;
+    for (let li = 0; li < NL; li++) {
+      let e = 0;
+      for (let k = 0, q = li * 2 * G; k < 2 * G; k++, q++) { const p = k & 1 ? pad : padB, i = s + fl[q]; e += p[i] + (p[i + 1] - p[i]) * fr[q]; }
+      let best = 0, bk = -128;
+      const j0 = Math.max(0, li - dL), j1 = Math.min(NL - 1, li + dL);
+      for (let lj = j0; lj <= j1; lj++) {
+        const pr = prow[lj];
+        if (pr < 0) continue;
+        const v = V[pr + lj] - pen[li * W + lj - li + dL];
+        if (v > best) { best = v; bk = lj - li; }
+      }
+      const v = e - prior[li] + best;
+      V[row + li] = v;
+      back[s * NL + li] = bk;
+      if (s >= F - Lmax && v >= bv) { bv = v; bs = s; bl = li; }
+    }
+  }
+  if (bs < 0) return null;
+  const bars = [];
+  for (let s = bs, li = bl; ;) {
+    bars.push({ s: s * D + (D - 1) / 2, L: (Lmin + li) * D }); // まとめたフレームの真ん中
+    const d = back[s * NL + li];
+    if (d === -128) break;
+    li += d;
+    s -= Lmin + li;
+    if (s < 0) break;
+  }
+  bars.reverse();
+  // 小節のはっきりさ：拍と 8 分の位置の強さ ÷ 位置を少しずらしたときの強さ（1 ならでたらめ）
+  for (const b of bars) {
+    let e = 0, m = 0;
+    for (let k = 0; k < 2 * G; k++) e += sampleOnset(sm, fps, (b.s + (k * b.L) / (2 * G)) / fps);
+    for (let q = 1; q < 8; q++) for (let k = 0; k < 2 * G; k++) m += sampleOnset(sm, fps, (b.s + ((k + q / 8) * b.L) / (2 * G)) / fps);
+    b.clear = e / (m / 7 + 1e-9);
+  }
+  return bars;
+}
+
+// 拍の並びを決める：小節ごとの拍（trackBars・表と裏は同じ重み）と一定の格子（refineGrid）をくらべ、
+// 格子から大きくはみ出す（8 分の 3/4 以上・最大 0.2 秒）はっきりした小節が 3 つ以上なら「揺れあり」。
+// 打ち込みの曲（はみ出しなし）は、今まで通り格子をそのまま使う。
+// 揺れありの曲は、拍（と低い音の立ち上がり）を少し重く見てもう一度合わせ直す（表と裏が途中で入れかわりにくい）。
+// ただし格子にぴったり（±0.03 秒）の長い区間（8 小節以上）は格子の拍にする。
+function planBeats(beats, grid, onset, lowOnset, fps, duration) {
+  const iv = [];
+  for (let i = 1; i < beats.length; i++) iv.push(beats[i] - beats[i - 1]);
+  const P0 = median(iv) * fps;
+  const bars = iv.length >= 16 ? trackBars(onset, fps, P0) : null;
+  if (!bars || bars.length < 4) return { beats: grid.steady ? grid.beats : extendBeats(beats, duration), steady: grid.steady, follow: false };
+  const G = BAR_BEATS, T = grid.T, a = grid.a;
+  // 格子の拍とのずれ（DP の i 小節目の頭 ↔ 格子の同じ番号の拍）と、その中央値
+  const devOf = (bs) => {
+    const k0 = Math.round((bs[0].s / fps - a) / T);
+    const dev = bs.map((bar, i) => bar.s / fps - (a + (k0 + i * G) * T));
+    const sure = bs.map((bar) => bar.clear >= 1.5);
+    return { k0, dev, sure, ref: median(dev.filter((_, i) => sure[i])) };
+  };
+  if (T) {
+    const { dev, sure, ref } = devOf(bars);
+    const lim = Math.min(0.375 * T, 0.2);
+    let big = 0;
+    dev.forEach((d, i) => { if (sure[i] && Math.abs(d - ref) > lim) big++; });
+    if (grid.steady && big < 3) return { beats: grid.beats, steady: true, follow: false, gridShare: 1 };
+  }
+  const fb = trackBars(onset, fps, P0, 0.9, lowOnset, 0.25) || bars;
+  const snap = new Uint8Array(fb.length);
+  let gb = null;
+  if (T) {
+    // 格子にぴったりの長い区間だけ格子にそろえる
+    const { k0, dev, sure, ref } = devOf(fb);
+    const lev = Math.round(ref / (T / 2)) * (T / 2);
+    const tol = Math.min(0.06 * T, 0.03);
+    const on = dev.map((d) => Math.abs(d - lev) <= tol);
+    for (let i = 0; i < fb.length;) {
+      if (!on[i] && sure[i]) { i++; continue; }
+      let j = i, n = 0;
+      while (j < fb.length && (on[j] || !sure[j])) { if (on[j] && sure[j]) n++; j++; }
+      if (n >= 8) snap.fill(1, i, j);
+      i = j;
+    }
+    gb = (i, k) => a + lev + (k0 + i * G + k) * T;
+  }
+  const out = [];
+  const at = (i, k) => (snap[i] ? gb(i, k) : (fb[i].s + (k * fb[i].L) / G) / fps);
+  fb.forEach((_, i) => { for (let k = 0; k < G; k++) out.push(at(i, k)); });
+  out.push(at(fb.length - 1, G));
+  const nsnap = snap.reduce((s, x) => s + x, 0);
+  return {
+    beats: extendBeats(out.filter((t) => t >= 0 && t < duration), duration),
+    steady: false,
+    follow: true,
+    gridShare: Math.round((nsnap / fb.length) * 100) / 100,
+  };
 }
 
 // 表拍か裏拍か：低音の立ち上がり（キック・ベース）と、低音の和音の変わり目が多い方を拍とする
@@ -1227,7 +1366,16 @@ export function analyze(input, opts = {}) {
     const iv = [];
     for (let i = 1; i < beats.length; i++) iv.push(beats[i] - beats[i - 1]);
     const med = median(iv);
-    grid = { steady: iv.every((x) => Math.abs(x - med) < 0.012) };
+    // 一定の格子ならどの間隔も同じ。小節ごとに合わせた拍は、×2・÷2 のあとも少しずつ違う（間隔に比べて見る）
+    const steady = iv.every((x) => Math.abs(x - med) < med * 0.005);
+    // 格子にそろえた区間（同じ間隔が 32 拍以上続く所）の割合
+    let even = 0;
+    for (let i = 0, j = 0; i <= iv.length; i++) {
+      if (i < iv.length && Math.abs(iv[i] - iv[j]) < med * 1e-4) continue;
+      if (i - j >= 32) even += i - j;
+      j = i;
+    }
+    grid = { steady, follow: !steady, gridShare: steady ? 1 : Math.round((even / Math.max(1, iv.length)) * 100) / 100 };
   } else {
     let bpm0 = opts.bpm || estimateTempo(onset, A.fps, opts.preferBpm || 115);
     beats = trackBeats(onset, A.fps, bpm0);
@@ -1239,7 +1387,10 @@ export function analyze(input, opts = {}) {
       if (ratio > 1.7) { bpm0 /= 2; beats = trackBeats(onset, A.fps, bpm0); }
     }
     grid = refineGrid(beats, onset, A.fps, duration);
-    beats = grid.steady ? grid.beats : extendBeats(beats, duration);
+    // 打ち込みの曲は一定の格子のまま。生演奏で揺れる曲は、小節ごとにテンポを合わせ直した拍
+    const plan = planBeats(beats, grid, onset, lowOnset, A.fps, duration);
+    beats = plan.beats;
+    grid = { ...grid, steady: plan.steady, follow: plan.follow, gridShare: plan.gridShare };
     const ph = opts.keepPhase ? { beats, shifted: false } : chooseBeatPhase(beats, B, lowOnset, onset, A.fps, duration);
     beats = ph.beats;
     // 変化の検出は窓の分だけ早めに出るので、その分ずらす（合成音で -31〜-32ms を確認）
@@ -1325,6 +1476,14 @@ export function analyze(input, opts = {}) {
     tuning: A.tuning,
     bpm,
     steadyTempo: grid.steady,
+    // 小節ごとのテンポ（BPM）。揺れる曲では小節ごとに合わせ直した結果がそのまま出る
+    tempoCurve: bars.map((bar) => {
+      const e = Math.min(beats.length - 1, bar.b0 + bar.n);
+      const n = e - bar.b0;
+      return n > 0 ? Math.round((600 * n) / (beats[e] - beats[bar.b0])) / 10 : Math.round(bpm * 10) / 10;
+    }),
+    tempoFollow: !!grid.follow, // true＝小節ごとに合わせ直した（揺れあり）
+    tempoGridShare: grid.gridShare ?? (grid.steady ? 1 : 0), // 一定の格子にそろえた小節の割合
     meter,
     meterGuess: db.meter,
     meterContrast: { c3: Math.round(db.c3.contrast * 1000) / 1000, c4: Math.round(db.c4.contrast * 1000) / 1000 },

@@ -101,15 +101,30 @@ export function notesToMidi(notes, an, opt = {}) {
     if (n.dbl != null) { list.push({ tk: a, order: 1, bytes: [0x90, n.dbl, Math.max(1, vel - 8)] }); list.push({ tk: b, order: 0, bytes: [0x80, n.dbl, 0] }); }
   }
   list.sort((x, y) => x.tk - y.tk || x.order - y.order);
-  const t1 = [];
-  last = 0;
-  const ev1 = (tk, bytes) => { t1.push(...vlq(tk - last), ...bytes); last = tk; };
-  ev1(0, textEvent(0x03, 'Violin'));
-  ev1(0, [0xc0, 40]);
-  for (const e of list) ev1(e.tk, e.bytes);
-  ev1(last, [0xff, 0x2f, 0x00]);
-  const header = chunk('MThd', [0, 1, 0, 2, (PPQ >> 8) & 255, PPQ & 255]);
-  const bytes = new Uint8Array([...header, ...chunk('MTrk', t0), ...chunk('MTrk', t1)]);
+  const trackOf = (name, program, ch, evs) => {
+    const tr = [];
+    let lt = 0;
+    const put = (tk, bytes) => { tr.push(...vlq(tk - lt), ...bytes); lt = tk; };
+    put(0, textEvent(0x03, name));
+    put(0, [0xc0 | ch, program]);
+    for (const e of evs) put(e.tk, e.bytes.length === 3 && (e.bytes[0] & 0xe0) === 0x80 ? [(e.bytes[0] & 0xf0) | ch, e.bytes[1], e.bytes[2]] : e.bytes);
+    put(lt, [0xff, 0x2f, 0x00]);
+    return tr;
+  };
+  const tracks = [trackOf('Violin', 40, 0, list)];
+  // ほかの楽器（再アレンジのアコギなど）：{ name, program（GM 番号 0〜127）, channel, notes: [{ t, d, midi, vel }] }
+  for (const xt of opt.extraTracks || []) {
+    const evs = [];
+    for (const n of xt.notes) {
+      const a = tick(n.t), b = Math.max(a + 1, tick(n.t + n.d));
+      const vel = Math.max(1, Math.min(127, Math.round(20 + 100 * n.vel)));
+      evs.push({ tk: a, order: 1, bytes: [0x90, n.midi, vel] }, { tk: b, order: 0, bytes: [0x80, n.midi, 0] });
+    }
+    evs.sort((x, y) => x.tk - y.tk || x.order - y.order);
+    tracks.push(trackOf(xt.name, xt.program ?? 25, xt.channel ?? tracks.length, evs));
+  }
+  const header = chunk('MThd', [0, 1, 0, 1 + tracks.length, (PPQ >> 8) & 255, PPQ & 255]);
+  const bytes = new Uint8Array([...header, ...chunk('MTrk', t0), ...tracks.flatMap((tr) => chunk('MTrk', tr))]);
   return new Blob([bytes], { type: 'audio/midi' });
 }
 
