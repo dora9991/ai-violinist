@@ -1014,7 +1014,8 @@ function applyMix() {
 // 再アレンジのときの音量：歌の大きさに合わせて、ギターとバイオリンを決める（歌がまだなければ原曲から）
 function updateTrioLevels() {
   const ref = S.trio.vocalBuf ? loudnessOf(S.trio.vocalBuf) : loudnessOf(S.songBuf) * 0.6;
-  S.trio.levels = { violin: (ref / 0.1) * 0.6, guitar: Math.max(0.15, Math.min(3, (ref / 0.1) * 0.75)) };
+  // 実曲で測った大きさ（歌だけ・ギターだけ・バイオリンだけの平均）：ギターは歌の 4〜5dB 下、バイオリンは 5dB 下くらいに
+  S.trio.levels = { violin: (ref / 0.1) * 0.6, guitar: Math.max(0.15, Math.min(4, (ref / 0.1) * 1.05)) };
 }
 const violinLevelNow = () => (S.arrMode === 'trio' ? S.trio.levels.violin : S.violinLevel);
 function currentTime() {
